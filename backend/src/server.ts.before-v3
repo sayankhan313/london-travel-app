@@ -1,0 +1,1046 @@
+import 'dotenv/config';
+import express, { type Request, type Response } from 'express';
+import cors from 'cors';
+import pg from 'pg';
+
+const { Pool } = pg;
+const app = express();
+const pool = new Pool();
+
+const PORT = Number(process.env.PORT ?? 3001);
+const TRANSCAPI_URL = 'https://api.transcapi.com';
+const XOTELO_URL = 'https://data.xotelo.com/api';
+
+app.use(cors());
+app.use(express.json());
+
+type PlaceType = 'attraction' | 'restaurant' | 'hotel';
+type PlaceFilter = { category: string; subtypes: string[] };
+
+const placeFilters: Record<PlaceType, PlaceFilter[]> = {
+  attraction: [
+    { category: 'tourism', subtypes: ['attraction', 'museum', 'gallery', 'zoo', 'aquarium', 'viewpoint', 'theme_park'] },
+    { category: 'historic', subtypes: ['castle', 'monument', 'memorial', 'ruins', 'archaeological_site'] },
+    { category: 'leisure', subtypes: ['park', 'garden', 'nature_reserve'] },
+  ],
+  restaurant: [
+    { category: 'amenity', subtypes: ['restaurant', 'cafe', 'fast_food', 'food_court'] },
+  ],
+  hotel: [
+    { category: 'tourism', subtypes: ['hotel', 'hostel', 'guest_house', 'motel'] },
+  ],
+};
+
+function readNumber(value: unknown, fallback?: number): number {
+  if (value === undefined) return fallback ?? NaN;
+  if (typeof value !== 'string' || !value.trim()) return NaN;
+  return Number(value);
+}
+
+function validCoordinates(lat: number, lon: number): boolean {
+  return Number.isFinite(lat) && lat >= -90 && lat <= 90 &&
+    Number.isFinite(lon) && lon >= -180 && lon <= 180;
+}
+
+function validInteger(n: number, min: number, max: number): boolean {
+  return Number.isInteger(n) && n >= min && n <= max;
+}
+
+function badRequest(res: Response, message: string): void {
+  res.status(400).json({ success: false, error: message });
+}
+
+function validDate(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+
+// =====================================================
+// HEALTH + UK CITY SEARCH
+// =====================================================
+app.get('/health', async (_req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ status: 'ok', database: 'connected' });
+  } catch (error) {
+    console.error('Health check failed:', error);
+    res.status(500).json({ status: 'error', database: 'disconnected' });
+  }
+});
+
+app.get('/api/cities', async (req, res) => {
+  const search = req.query.search;
+  if (typeof search !== 'string' || !search.trim() || search.trim().length > 100) {
+    badRequest(res, 'Provide a valid city search');
+    return;
+  }
+  const query = search.trim();
+  try {
+    const result = await pool.query(
+      `SELECT name, place_type,
+              ST_Y(geom) AS latitude, ST_X(geom) AS longitude
+       FROM cities
+       WHERE LOWER(name) LIKE LOWER($1) || '%'
+       ORDER BY
+         CASE WHEN LOWER(name) = LOWER($1) THEN 0 ELSE 1 END,
+         CASE place_type WHEN 'city' THEN 1 WHEN 'town' THEN 2 WHEN 'village' THEN 3 ELSE 4 END,
+         name ASC
+       LIMIT 10`,
+      [query]
+    );
+    res.json({ success: true, search: query, count: result.rows.length, cities: result.rows });
+  } catch (error) {
+    console.error('City search failed:', error);
+    res.status(500).json({ success: false, error: 'Unable to search cities' });
+  }
+});
+
+// =====================================================
+// OSM / POSTGIS PLACES
+// =====================================================
+async function findPlaces(req: Request, res: Response, type: PlaceType): Promise<void> {
+  const lat = readNumber(req.query.lat);
+  const lon = readNumber(req.query.lon);
+  const radius = readNumber(req.query.radius, 3000);
+  const limit = readNumber(req.query.limit, 10);
+
+  if (!validCoordinates(lat, lon) || !Number.isFinite(radius) || radius <= 0 ||
+      radius > 25000 || !validInteger(limit, 1, 50)) {
+    badRequest(res, 'Invalid latitude, longitude, radius or limit');
+    return;
+  }
+
+  const params: unknown[] = [lon, lat, radius, limit];
+  const conditions = placeFilters[type].map((filter) => {
+    params.push(filter.category);
+    const cat = params.length;
+    params.push(filter.subtypes);
+    const sub = params.length;
+    return `(p.category = $${cat} AND p.subcategory = ANY($${sub}::text[]))`;
+  }).join(' OR ');
+
+  // The existing imported places.geom is EPSG:3857.
+  // Transform before querying as geography (EPSG:4326).
+  const sql = `
+    WITH center AS (
+      SELECT ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography AS point
+    )
+    SELECT p.osm_id, p.osm_type, p.name, p.category, p.subcategory,
+           ST_Y(ST_Transform(p.geom, 4326)) AS latitude,
+           ST_X(ST_Transform(p.geom, 4326)) AS longitude,
+           ROUND(ST_Distance(ST_Transform(p.geom, 4326)::geography, center.point))::integer AS distance_m,
+           p.tags->>'cuisine' AS cuisine,
+           p.tags->>'opening_hours' AS opening_hours,
+           p.tags->>'diet:vegetarian' AS vegetarian,
+           p.tags->>'diet:vegan' AS vegan,
+           p.tags->>'website' AS website,
+           p.tags->>'addr:street' AS street,
+           p.tags->>'addr:postcode' AS postcode,
+           p.tags->>'phone' AS phone
+    FROM places p CROSS JOIN center
+    WHERE (${conditions})
+      AND ST_DWithin(ST_Transform(p.geom, 4326)::geography, center.point, $3)
+    ORDER BY distance_m ASC
+    LIMIT $4
+  `;
+  try {
+    const result = await pool.query(sql, params);
+    res.json({ success: true, type, count: result.rows.length, places: result.rows });
+  } catch (error) {
+    console.error('Places search failed:', error);
+    res.status(500).json({ success: false, error: 'Failed to retrieve places' });
+  }
+}
+
+app.get('/api/attractions', (req, res) => { void findPlaces(req, res, 'attraction'); });
+app.get('/api/nearby', (req, res) => {
+  const type = req.query.type;
+  if (type !== 'restaurant' && type !== 'hotel') {
+    badRequest(res, 'type must be restaurant or hotel');
+    return;
+  }
+  void findPlaces(req, res, type);
+});
+
+// =====================================================
+// TRANSCAPI (existing provider integration)
+// =====================================================
+type CacheEntry = { expiresAt: number; data: unknown };
+const transportCache = new Map<string, CacheEntry>();
+
+async function callTransCAPI(
+  res: Response,
+  path: string,
+  params: URLSearchParams,
+  cacheMs: number
+): Promise<void> {
+  const apiKey = process.env.TRANSCAPI_API_KEY?.trim();
+  if (!apiKey) {
+    res.status(503).json({ success: false, error: 'TransCAPI API key is not configured' });
+    return;
+  }
+  const url = new URL(path, TRANSCAPI_URL);
+  url.search = params.toString();
+  const cacheKey = url.toString();
+  const cached = transportCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    res.setHeader('X-Cache', 'HIT');
+    res.json({ success: true, source: 'TransCAPI', data: cached.data });
+    return;
+  }
+  try {
+    const upstream = await fetch(url, {
+      headers: { 'X-Api-Key': apiKey, Accept: 'application/json' },
+      signal: AbortSignal.timeout(15000),
+    });
+    const raw = await upstream.text();
+    let data: unknown;
+    try { data = JSON.parse(raw); } catch {
+      res.status(502).json({ success: false, error: 'Invalid response from TransCAPI' });
+      return;
+    }
+    const remaining = upstream.headers.get('x-ratelimit-daily-remaining');
+    if (remaining !== null) res.setHeader('X-RateLimit-Daily-Remaining', remaining);
+    if (!upstream.ok) {
+      const retryAfter = upstream.headers.get('retry-after');
+      if (retryAfter) res.setHeader('Retry-After', retryAfter);
+      const status = upstream.status === 401 || upstream.status === 403 ? 502 : upstream.status;
+      res.status(status).json({
+        success: false,
+        source: 'TransCAPI',
+        error: 'Transport provider request failed',
+        providerStatus: upstream.status,
+        details: data,
+      });
+      return;
+    }
+    if (transportCache.size >= 200) transportCache.clear();
+    transportCache.set(cacheKey, { expiresAt: Date.now() + cacheMs, data });
+    res.setHeader('X-Cache', 'MISS');
+    res.json({ success: true, source: 'TransCAPI', data });
+  } catch (error) {
+    console.error('TransCAPI request failed:', error);
+    const timeout = error instanceof Error &&
+      (error.name === 'TimeoutError' || error.name === 'AbortError');
+    res.status(timeout ? 504 : 502).json({
+      success: false,
+      error: timeout ? 'TransCAPI request timed out' : 'Unable to reach TransCAPI',
+    });
+  }
+}
+
+app.get('/api/transport/stops', (req, res) => {
+  const lat = readNumber(req.query.lat);
+  const lon = readNumber(req.query.lon);
+  const radius = readNumber(req.query.radius, 500);
+  const limit = readNumber(req.query.limit, 10);
+  if (!validCoordinates(lat, lon) || !validInteger(radius, 1, 5000) || !validInteger(limit, 1, 20)) {
+    badRequest(res, 'Invalid stop search coordinates, radius or limit');
+    return;
+  }
+  void callTransCAPI(res, '/v1/bus/stops.json', new URLSearchParams({
+    lat: String(lat), lon: String(lon), radius: String(radius), limit: String(limit),
+  }), 10 * 60 * 1000);
+});
+
+app.get('/api/transport/journey', (req, res) => {
+  const fromLat = readNumber(req.query.from_lat);
+  const fromLon = readNumber(req.query.from_lon);
+  const toLat = readNumber(req.query.to_lat);
+  const toLon = readNumber(req.query.to_lon);
+  const limit = readNumber(req.query.limit, 3);
+  if (!validCoordinates(fromLat, fromLon) || !validCoordinates(toLat, toLon) ||
+      !validInteger(limit, 1, 10)) {
+    badRequest(res, 'Invalid journey coordinates or limit');
+    return;
+  }
+  const params = new URLSearchParams({
+    from_lat: String(fromLat), from_lon: String(fromLon),
+    to_lat: String(toLat), to_lon: String(toLon),
+    limit: String(limit), include_fares: 'true', include_live: 'true',
+  });
+  if (req.query.datetime !== undefined) {
+    const date = req.query.datetime;
+    if (typeof date !== 'string' || !date.trim() || !Number.isFinite(Date.parse(date))) {
+      badRequest(res, 'Invalid datetime');
+      return;
+    }
+    params.set('datetime', date);
+  }
+  if (req.query.arrive_by !== undefined) {
+    if (req.query.arrive_by !== 'true' && req.query.arrive_by !== 'false') {
+      badRequest(res, 'arrive_by must be true or false');
+      return;
+    }
+    params.set('arrive_by', req.query.arrive_by);
+  }
+  if (req.query.max_walk_distance !== undefined) {
+    const maxWalk = readNumber(req.query.max_walk_distance);
+    if (!validInteger(maxWalk, 1, 10000)) {
+      badRequest(res, 'Invalid max_walk_distance');
+      return;
+    }
+    params.set('max_walk_distance', String(maxWalk));
+  }
+  void callTransCAPI(res, '/v1/journey.json', params, 60 * 1000);
+});
+
+app.get('/api/transport/bus/departures', (req, res) => {
+  const atcocode = req.query.atcocode;
+  if (typeof atcocode !== 'string' || !/^[a-zA-Z0-9]{5,20}$/.test(atcocode)) {
+    badRequest(res, 'Provide a valid ATCO stop code');
+    return;
+  }
+  const params = new URLSearchParams({ live: 'true', limit: '10' });
+  void callTransCAPI(res, `/v1/bus/stop_timetables/${atcocode}.json`, params, 30 * 1000);
+});
+
+app.get('/api/transport/rail/stations', (req, res) => {
+  const lat = readNumber(req.query.lat);
+  const lon = readNumber(req.query.lon);
+  const radius = readNumber(req.query.radius, 5000);
+  const limit = readNumber(req.query.limit, 10);
+  if (!validCoordinates(lat, lon) || !validInteger(radius, 1, 15000) || !validInteger(limit, 1, 20)) {
+    badRequest(res, 'Invalid rail station search parameters');
+    return;
+  }
+  void callTransCAPI(res, '/v1/rail/stations.json', new URLSearchParams({
+    lat: String(lat), lon: String(lon), radius: String(radius), limit: String(limit),
+  }), 10 * 60 * 1000);
+});
+
+app.get('/api/transport/rail/departures', (req, res) => {
+  const crs = req.query.crs;
+  if (typeof crs !== 'string' || !/^[a-zA-Z]{3}$/.test(crs)) {
+    badRequest(res, 'Provide a valid three-letter CRS code');
+    return;
+  }
+  const params = new URLSearchParams({ live: 'true', limit: '10' });
+  void callTransCAPI(res, `/v1/rail/station_timetables/${crs.toUpperCase()}.json`, params, 30 * 1000);
+});
+
+// =====================================================
+// XOTELO HOTEL PRICES: /list and /rates
+// Xotelo uses TripAdvisor location and hotel keys,
+// NOT OpenStreetMap osm_id values.
+// =====================================================
+const xoteloCache = new Map<string, CacheEntry>();
+
+async function callXotelo(
+  res: Response,
+  path: '/list' | '/rates',
+  params: URLSearchParams,
+  cacheMs: number
+): Promise<void> {
+  const url = `${XOTELO_URL}${path}?${params.toString()}`;
+  const cached = xoteloCache.get(url);
+  if (cached && cached.expiresAt > Date.now()) {
+    res.setHeader('X-Cache', 'HIT');
+    res.json({ success: true, source: 'Xotelo', endpoint: path.slice(1), data: cached.data });
+    return;
+  }
+  try {
+    const upstream = await fetch(url, {
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(25000),
+    });
+    const raw = await upstream.text();
+    let payload: unknown;
+    try { payload = JSON.parse(raw); } catch {
+      res.status(502).json({ success: false, error: 'Xotelo returned non-JSON data', providerStatus: upstream.status });
+      return;
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      res.status(502).json({ success: false, error: 'Unexpected Xotelo response' });
+      return;
+    }
+    const data = payload as { error?: unknown; result?: unknown; timestamp?: number };
+    // Xotelo sometimes returns HTTP 200 with an error in its JSON body.
+    if (!upstream.ok || (data.error !== null && data.error !== undefined && data.error !== '')) {
+      res.status(upstream.status === 429 ? 429 : 502).json({
+        success: false,
+        source: 'Xotelo',
+        providerStatus: upstream.status,
+        error: 'Xotelo could not return hotel data',
+        details: data.error ?? null,
+      });
+      return;
+    }
+    if (!data.result || typeof data.result !== 'object') {
+      res.status(502).json({ success: false, error: 'Xotelo response has no result' });
+      return;
+    }
+    if (xoteloCache.size >= 100) xoteloCache.clear();
+    xoteloCache.set(url, { expiresAt: Date.now() + cacheMs, data: payload });
+    res.setHeader('X-Cache', 'MISS');
+    res.json({ success: true, source: 'Xotelo', endpoint: path.slice(1), data: payload });
+  } catch (error) {
+    console.error('Xotelo request failed:', error);
+    const timeout = error instanceof Error &&
+      (error.name === 'TimeoutError' || error.name === 'AbortError');
+    res.status(timeout ? 504 : 502).json({
+      success: false,
+      source: 'Xotelo',
+      error: timeout ? 'Xotelo request timed out' : 'Unable to reach Xotelo',
+    });
+  }
+}
+
+// GET /api/hotels/xotelo/list?location_key=g186338&limit=5&sort=popularity
+app.get('/api/hotels/xotelo/list', (req, res) => {
+  const locationKey = req.query.location_key;
+  const limit = readNumber(req.query.limit, 10);
+  const offset = readNumber(req.query.offset, 0);
+  const sort = req.query.sort ?? 'popularity';
+  if (typeof locationKey !== 'string' || !/^g\d+$/.test(locationKey) ||
+      !validInteger(limit, 1, 100) || !validInteger(offset, 0, 100000) ||
+      typeof sort !== 'string' || !['best_value', 'popularity', 'distance'].includes(sort)) {
+    badRequest(res, 'Invalid location_key, limit, offset or sort');
+    return;
+  }
+  void callXotelo(res, '/list', new URLSearchParams({
+    location_key: locationKey, limit: String(limit), offset: String(offset), sort,
+  }), 30 * 60 * 1000);
+});
+
+// GET /api/hotels/xotelo/rates?hotel_key=g123-d456&chk_in=2026-12-01&chk_out=2026-12-03&currency=GBP
+app.get('/api/hotels/xotelo/rates', (req, res) => {
+  const hotelKey = req.query.hotel_key;
+  const checkIn = req.query.chk_in;
+  const checkOut = req.query.chk_out;
+  const currency = req.query.currency ?? 'GBP';
+  const rooms = readNumber(req.query.rooms, 1);
+  const adults = readNumber(req.query.adults, 2);
+  const children = req.query.age_of_children;
+  const supportedCurrencies = new Set([
+    'USD', 'GBP', 'EUR', 'CAD', 'CHF', 'AUD', 'JPY', 'CNY', 'INR',
+    'THB', 'BRL', 'HKD', 'RUB', 'BZD',
+  ]);
+
+  if (typeof hotelKey !== 'string' || !/^g\d+-d\d+$/.test(hotelKey) ||
+      typeof checkIn !== 'string' || !validDate(checkIn) ||
+      typeof checkOut !== 'string' || !validDate(checkOut) ||
+      typeof currency !== 'string' || !supportedCurrencies.has(currency) ||
+      !validInteger(rooms, 1, 8) || !validInteger(adults, 1, 32)) {
+    badRequest(res, 'Invalid hotel_key, dates, currency, rooms or adults');
+    return;
+  }
+
+  const nights = Math.round((Date.parse(`${checkOut}T00:00:00Z`) - Date.parse(`${checkIn}T00:00:00Z`)) / 86400000);
+  if (checkIn < new Date().toISOString().slice(0, 10) || nights < 1 || nights > 30) {
+    badRequest(res, 'Dates must be in the future and stay must be 1 to 30 nights');
+    return;
+  }
+
+  const params = new URLSearchParams({
+    hotel_key: hotelKey,
+    chk_in: checkIn,
+    chk_out: checkOut,
+    currency,
+    rooms: String(rooms),
+    adults: String(adults),
+  });
+  if (children !== undefined) {
+    if (typeof children !== 'string' || !/^\d{1,2}(,\d{1,2})*$/.test(children) ||
+        children.split(',').length > 10 || children.split(',').some((x) => Number(x) > 17)) {
+      badRequest(res, 'age_of_children must be comma-separated ages 0 through 17');
+      return;
+    }
+    params.set('age_of_children', children);
+  }
+  void callXotelo(res, '/rates', params, 5 * 60 * 1000);
+});
+
+// =====================================================
+// UNIFIED HOTEL DISCOVERY: XOTELO + LOCAL OSM / POSTGIS
+//
+// Xotelo hotel keys, ratings, images and prices are always
+// taken from the provider. OSM properties are linked ONLY
+// if the name and location indicate the same accommodation.
+//
+// Xotelo's free /list needs a TripAdvisor city location_key.
+// The three known UK keys below are CITY keys, NOT hotel IDs.
+// Any other UK city still works with OSM-only fallback, or
+// callers can supply a verified location_key=g... themselves.
+// Xotelo /search is advertised through RapidAPI, so this
+// code does not pretend an unsupported free lookup exists.
+// =====================================================
+
+type XoteloHotel = {
+  key: string;
+  name: string;
+  geo?: { latitude?: number; longitude?: number };
+  image?: string;
+  url?: string;
+  accommodation_type?: string;
+  review_summary?: { rating?: number; count?: number };
+};
+
+type NearbyOSMMatch = {
+  hotel_key: string;
+  osm_id: string;
+  osm_type: string;
+  osm_name: string;
+  subcategory: string;
+  osm_latitude: number;
+  osm_longitude: number;
+  match_distance_m: number;
+};
+
+type OSMHotel = {
+  osm_id: string;
+  osm_type: string;
+  name: string;
+  subcategory: string;
+  latitude: number;
+  longitude: number;
+  distance_m: number;
+};
+
+type XoteloPayload = {
+  error?: unknown;
+  timestamp?: number;
+  result: Record<string, unknown>;
+};
+
+type MatchConfidence = 'high' | 'medium';
+
+type HotelMatch = {
+  status: 'confirmed' | 'possible' | 'unmatched';
+  confidence: MatchConfidence | null;
+  name_score: number | null;
+  separation_m: number | null;
+  osm: null | {
+    osm_id: string;
+    osm_type: string;
+    name: string;
+    subcategory: string;
+  };
+};
+
+type SelectedHotel = {
+  hotel_key: string;
+  name: string;
+  latitude: number;
+  longitude: number;
+  distance_m: number;
+  rating: number | null;
+  review_count: number | null;
+  image: string | null;
+  tripadvisor_url: string | null;
+  accommodation_type: string | null;
+  match: HotelMatch;
+  rates: null | {
+    currency: 'GBP';
+    chk_in: string;
+    chk_out: string;
+    offers: { provider: string; price_per_room_per_night_gbp: number }[];
+    lowest_price_per_room_per_night_gbp: number | null;
+    quoted_at: number | null;
+    note: string;
+  };
+  rates_error: string | null;
+};
+
+const HOTEL_CITY_KEYS: Record<string, string> = {
+  london: 'g186338',
+  manchester: 'g187069',
+  edinburgh: 'g186525',
+};
+
+// Ignore generic hotel descriptors, not individual hotel names.
+const GENERIC_HOTEL_WORDS = new Set([
+  'the', 'a', 'an', 'hotel', 'hotels', 'by', 'at', 'and', 'of',
+  'collection', 'curio', 'resort',
+]);
+
+function normaliseHotelName(name: string): string {
+  return name.normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\bsaint\b/g, 'st')
+    .trim().replace(/\s+/g, ' ');
+}
+
+function hotelTokens(name: string): string[] {
+  return [...new Set(normaliseHotelName(name)
+    .split(' ')
+    .filter((word) => word && !GENERIC_HOTEL_WORDS.has(word)))];
+}
+
+function hotelSimilarity(left: string, right: string): {
+  score: number;
+  matched: number;
+  shorterCoverage: number;
+  shorterSize: number;
+} {
+  const a = hotelTokens(left);
+  const b = hotelTokens(right);
+  if (!a.length || !b.length) {
+    return { score: 0, matched: 0, shorterCoverage: 0, shorterSize: 0 };
+  }
+  const aa = new Set(a);
+  const bb = new Set(b);
+  const matched = a.filter((word) => bb.has(word)).length;
+  const shorterSize = Math.min(aa.size, bb.size);
+  const shorterCoverage = matched / shorterSize;
+  const union = new Set([...a, ...b]).size;
+  const jaccard = matched / union;
+
+  // Ordered shared tokens matter: "The Trafalgar St James" can
+  // match "The Trafalgar St James London, Curio Collection by Hilton".
+  const shorter = a.length <= b.length ? a : b;
+  const longer = a.length <= b.length ? b : a;
+  let sequence = 0;
+  let index = 0;
+  for (const token of shorter) {
+    while (index < longer.length && longer[index] !== token) index++;
+    if (index < longer.length) {
+      sequence++;
+      index++;
+    }
+  }
+  const orderedCoverage = sequence / shorter.length;
+  const score = 0.40 * shorterCoverage + 0.35 * jaccard + 0.25 * orderedCoverage;
+  return { score, matched, shorterCoverage, shorterSize };
+}
+
+function scoreHotelMatch(xotelo: string, osm: string, metres: number): {
+  score: number;
+  confidence: MatchConfidence | null;
+} {
+  const sim = hotelSimilarity(xotelo, osm);
+  if (!Number.isFinite(metres) || metres > 160 || sim.matched === 0) {
+    return { score: sim.score, confidence: null };
+  }
+  // A single distinctive word (e.g., "Midland") isn't enough
+  // for an automatic price association unless names reduce to
+  // precisely the same token and coordinates are very close.
+  if (sim.shorterSize === 1) {
+    const oneWordExact = hotelTokens(xotelo).join(' ') === hotelTokens(osm).join(' ');
+    return { score: sim.score, confidence: oneWordExact && metres <= 18 ? 'high' : null };
+  }
+  if (sim.score >= 0.98 && metres <= 100) {
+    return { score: sim.score, confidence: 'high' };
+  }
+  // Strong shared name with extra marketing/brand suffix.
+  if (sim.matched >= 3 && sim.shorterCoverage === 1 &&
+      sim.score >= 0.73 && metres <= 45) {
+    return { score: sim.score, confidence: 'high' };
+  }
+  if (sim.matched >= 2 && sim.score >= 0.88 && metres <= 55) {
+    return { score: sim.score, confidence: 'high' };
+  }
+  // Borderline name variation: expose as 'possible'; never
+  // attach the OSM identity automatically.
+  if (sim.matched >= 2 && sim.shorterCoverage >= 0.75 &&
+      sim.score >= 0.64 && metres <= 70) {
+    return { score: sim.score, confidence: 'medium' };
+  }
+  return { score: sim.score, confidence: null };
+}
+
+function geoDistanceM(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const toRad = (n: number) => (n * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const h = Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 6371000 * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(Math.max(0, 1 - h)));
+}
+
+async function fetchXoteloForMatching(
+  path: '/list' | '/rates',
+  params: URLSearchParams,
+  cacheMs: number
+): Promise<XoteloPayload> {
+  const url = `${XOTELO_URL}${path}?${params.toString()}`;
+  const cached = xoteloCache.get(url);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.data as XoteloPayload;
+  }
+  const upstream = await fetch(url, {
+    headers: { Accept: 'application/json' },
+    signal: AbortSignal.timeout(25000),
+  });
+  const payload: unknown = await upstream.json();
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error('Xotelo returned an unexpected response');
+  }
+  const parsed = payload as { error?: unknown; timestamp?: number; result?: unknown };
+  if (!upstream.ok || (parsed.error !== null && parsed.error !== undefined && parsed.error !== '')) {
+    throw new Error(`Xotelo ${path} failed (HTTP ${upstream.status}): ${String(parsed.error ?? 'provider error')}`);
+  }
+  if (!parsed.result || typeof parsed.result !== 'object' || Array.isArray(parsed.result)) {
+    throw new Error(`Xotelo ${path} response has no result`);
+  }
+  if (xoteloCache.size >= 100) xoteloCache.clear();
+  xoteloCache.set(url, { expiresAt: Date.now() + cacheMs, data: payload });
+  return parsed as XoteloPayload;
+}
+
+const OSM_HOTEL_MATCH_SQL = `
+  WITH source_hotels AS (
+    SELECT * FROM jsonb_to_recordset($1::jsonb)
+      AS x(hotel_key text, latitude double precision, longitude double precision)
+  )
+  SELECT x.hotel_key, p.osm_id::text AS osm_id, p.osm_type,
+    p.name AS osm_name, p.subcategory,
+    ST_Y(ST_Transform(p.geom, 4326)) AS osm_latitude,
+    ST_X(ST_Transform(p.geom, 4326)) AS osm_longitude,
+    ROUND(ST_Distance(
+      ST_Transform(p.geom, 4326)::geography,
+      ST_SetSRID(ST_MakePoint(x.longitude, x.latitude), 4326)::geography
+    ))::integer AS match_distance_m
+  FROM source_hotels x
+  JOIN LATERAL (
+    SELECT p.osm_id, p.osm_type, p.name, p.subcategory, p.geom
+    FROM places p
+    WHERE p.category = 'tourism'
+      AND p.subcategory IN ('hotel', 'hostel', 'guest_house', 'motel')
+      AND p.name IS NOT NULL AND length(trim(p.name)) > 0
+      AND ST_DWithin(
+        ST_Transform(p.geom, 4326)::geography,
+        ST_SetSRID(ST_MakePoint(x.longitude, x.latitude), 4326)::geography,
+        160
+      )
+    ORDER BY ST_Distance(
+      ST_Transform(p.geom, 4326)::geography,
+      ST_SetSRID(ST_MakePoint(x.longitude, x.latitude), 4326)::geography
+    ) ASC
+    LIMIT 10
+  ) p ON true
+`;
+
+const NEARBY_OSM_HOTELS_SQL = `
+  WITH center AS (
+    SELECT ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography AS point
+  )
+  SELECT p.osm_id::text AS osm_id, p.osm_type, p.name, p.subcategory,
+    ST_Y(ST_Transform(p.geom, 4326)) AS latitude,
+    ST_X(ST_Transform(p.geom, 4326)) AS longitude,
+    ROUND(ST_Distance(
+      ST_Transform(p.geom, 4326)::geography, center.point
+    ))::integer AS distance_m
+  FROM places p CROSS JOIN center
+  WHERE p.category = 'tourism'
+    AND p.subcategory IN ('hotel', 'hostel', 'guest_house', 'motel')
+    AND p.name IS NOT NULL AND length(trim(p.name)) > 0
+    AND ST_DWithin(ST_Transform(p.geom, 4326)::geography, center.point, $3)
+  ORDER BY distance_m ASC
+  LIMIT $4
+`;
+
+function emptyMatch(): HotelMatch {
+  return {
+    status: 'unmatched', confidence: null, name_score: null,
+    separation_m: null, osm: null,
+  };
+}
+
+function osmIdentity(osm: { osm_type: string; osm_id: string }): string {
+  return `${osm.osm_type}:${osm.osm_id}`;
+}
+
+// GET /api/hotels/matched?city=London&lat=51.5074456&lon=-0.1277653&radius=6000&limit=12&pages=2
+// Optional price lookup: use an exact returned hotel_key with GET /api/hotels/xotelo/rates
+// Optional legacy price sample: &chk_in=YYYY-MM-DD&chk_out=YYYY-MM-DD&priced_limit=1
+app.get('/api/hotels/matched', async (req, res) => {
+  const city = typeof req.query.city === 'string' ? req.query.city.trim() : '';
+  const providedKey = req.query.location_key;
+  const locationKey = providedKey === undefined
+    ? HOTEL_CITY_KEYS[city.toLowerCase()]
+    : providedKey;
+  const lat = readNumber(req.query.lat);
+  const lon = readNumber(req.query.lon);
+  const radius = readNumber(req.query.radius, 5000);
+  const limit = readNumber(req.query.limit, 10);
+  const pages = readNumber(req.query.pages, 2);
+  const pricedLimit = readNumber(req.query.priced_limit, 0);
+  const checkIn = req.query.chk_in;
+  const checkOut = req.query.chk_out;
+
+  if (providedKey !== undefined &&
+      (typeof providedKey !== 'string' || !/^g\d+$/.test(providedKey))) {
+    badRequest(res, 'Invalid location_key; expected g followed by numbers');
+    return;
+  }
+  if (!validCoordinates(lat, lon) || !validInteger(radius, 100, 30000) ||
+      !validInteger(limit, 1, 20) || !validInteger(pages, 1, 3) ||
+      !validInteger(pricedLimit, 0, 2)) {
+    badRequest(res, 'Invalid coordinates, radius, limit, pages or priced_limit');
+    return;
+  }
+  if (pricedLimit > 0 && (
+    typeof checkIn !== 'string' || !validDate(checkIn) ||
+    typeof checkOut !== 'string' || !validDate(checkOut) ||
+    checkIn < new Date().toISOString().slice(0, 10) ||
+    (Date.parse(`${checkOut}T00:00:00Z`) - Date.parse(`${checkIn}T00:00:00Z`)) / 86400000 < 1 ||
+    (Date.parse(`${checkOut}T00:00:00Z`) - Date.parse(`${checkIn}T00:00:00Z`)) / 86400000 > 30
+  )) {
+    badRequest(res, 'priced_limit requires valid future chk_in/chk_out dates (1-30 nights)');
+    return;
+  }
+
+  try {
+    const fallbackRows = await pool.query<OSMHotel>(NEARBY_OSM_HOTELS_SQL,
+      [lon, lat, radius, Math.min(limit * 5, 100)]);
+
+    const collected: XoteloHotel[] = [];
+    let totalAvailable: number | null = null;
+    let pagesRead = 0;
+    let pageWarning: string | null = null;
+
+    // An unknown UK city does NOT fail: OSM-only results still work.
+    if (typeof locationKey === 'string' && /^g\d+$/.test(locationKey)) {
+      for (let page = 0; page < pages; page++) {
+        try {
+          const payload = await fetchXoteloForMatching('/list', new URLSearchParams({
+            location_key: locationKey, limit: '100',
+            offset: String(page * 100), sort: 'popularity',
+          }), 30 * 60 * 1000);
+          pagesRead++;
+          if (typeof payload.result.total_count === 'number') {
+            totalAvailable = payload.result.total_count;
+          }
+          const listings = Array.isArray(payload.result.list)
+            ? payload.result.list as XoteloHotel[] : [];
+          collected.push(...listings);
+          if (listings.length < 100) break;
+        } catch (error) {
+          // Do not lose locally available hotels due to provider downtime.
+          pageWarning = error instanceof Error ? error.message : 'Xotelo list failed';
+          break;
+        }
+      }
+    }
+
+    const seenKeys = new Set<string>();
+    const candidates = collected
+      .filter((hotel) => {
+        if (!hotel || typeof hotel.key !== 'string' || !/^g\d+-d\d+$/.test(hotel.key) ||
+            typeof hotel.name !== 'string' || !hotel.name.trim() ||
+            !hotel.geo || !validCoordinates(hotel.geo.latitude ?? NaN, hotel.geo.longitude ?? NaN) ||
+            seenKeys.has(hotel.key)) return false;
+        seenKeys.add(hotel.key);
+        return true;
+      })
+      .map((hotel) => ({
+        hotel,
+        latitude: hotel.geo!.latitude!,
+        longitude: hotel.geo!.longitude!,
+        distance_m: Math.round(geoDistanceM(lat, lon, hotel.geo!.latitude!, hotel.geo!.longitude!)),
+      }))
+      .filter((entry) => entry.distance_m <= radius)
+      .sort((a, b) => a.distance_m - b.distance_m);
+
+    const joined = candidates.length ? await pool.query<NearbyOSMMatch>(
+      OSM_HOTEL_MATCH_SQL,
+      [JSON.stringify(candidates.map((entry) => ({
+        hotel_key: entry.hotel.key,
+        latitude: entry.latitude,
+        longitude: entry.longitude,
+      })))]
+    ) : { rows: [] as NearbyOSMMatch[] };
+
+    const osmByXotelo = new Map<string, NearbyOSMMatch[]>();
+    for (const row of joined.rows) {
+      const group = osmByXotelo.get(row.hotel_key) ?? [];
+      group.push(row);
+      osmByXotelo.set(row.hotel_key, group);
+    }
+
+    type MatchChoice = {
+      osm: NearbyOSMMatch;
+      confidence: MatchConfidence;
+      score: number;
+    };
+    const choices = new Map<string, MatchChoice[]>();
+    for (const entry of candidates) {
+      const matches = (osmByXotelo.get(entry.hotel.key) ?? [])
+        .map((osm) => {
+          const scored = scoreHotelMatch(entry.hotel.name, osm.osm_name, Number(osm.match_distance_m));
+          return { osm, confidence: scored.confidence, score: scored.score };
+        })
+        .filter((match): match is MatchChoice => match.confidence !== null)
+        .sort((a, b) =>
+          Number(b.confidence === 'high') - Number(a.confidence === 'high') ||
+          b.score - a.score || a.osm.match_distance_m - b.osm.match_distance_m);
+      choices.set(entry.hotel.key, matches);
+    }
+
+    // One-to-one OSM association: rank strongest candidates first.
+    // Medium-confidence records stay flagged for review and don't
+    // become confirmed OSM associations.
+    const usedOSM = new Set<string>();
+    const assigned = new Map<string, HotelMatch>();
+    const matchOrder = [...candidates].sort((a, b) => {
+      const ax = choices.get(a.hotel.key)?.[0];
+      const bx = choices.get(b.hotel.key)?.[0];
+      return Number(bx?.confidence === 'high') - Number(ax?.confidence === 'high') ||
+        (bx?.score ?? 0) - (ax?.score ?? 0) || a.distance_m - b.distance_m;
+    });
+
+    for (const entry of matchOrder) {
+      const available = (choices.get(entry.hotel.key) ?? [])
+        .filter((choice) => !usedOSM.has(osmIdentity(choice.osm)));
+      const best = available[0];
+      if (!best) continue;
+      const second = available[1];
+      const ambiguous = second && best.confidence === 'high' &&
+        second.confidence === 'high' &&
+        Math.abs(best.score - second.score) < 0.025 &&
+        Math.abs(best.osm.match_distance_m - second.osm.match_distance_m) < 12 &&
+        normaliseHotelName(best.osm.osm_name) !== normaliseHotelName(second.osm.osm_name);
+      const confidence: MatchConfidence = ambiguous ? 'medium' : best.confidence;
+      assigned.set(entry.hotel.key, {
+        status: confidence === 'high' ? 'confirmed' : 'possible',
+        confidence,
+        name_score: Number(best.score.toFixed(3)),
+        separation_m: Number(best.osm.match_distance_m),
+        osm: {
+          osm_id: best.osm.osm_id,
+          osm_type: best.osm.osm_type,
+          name: best.osm.osm_name,
+          subcategory: best.osm.subcategory,
+        },
+      });
+      if (confidence === 'high') usedOSM.add(osmIdentity(best.osm));
+    }
+
+    const hotels: SelectedHotel[] = candidates.slice(0, limit).map((entry) => ({
+      hotel_key: entry.hotel.key,
+      name: entry.hotel.name,
+      latitude: entry.latitude,
+      longitude: entry.longitude,
+      distance_m: entry.distance_m,
+      rating: typeof entry.hotel.review_summary?.rating === 'number'
+        ? entry.hotel.review_summary.rating : null,
+      review_count: typeof entry.hotel.review_summary?.count === 'number'
+        ? entry.hotel.review_summary.count : null,
+      image: typeof entry.hotel.image === 'string' ? entry.hotel.image : null,
+      tripadvisor_url: typeof entry.hotel.url === 'string' ? entry.hotel.url : null,
+      accommodation_type: typeof entry.hotel.accommodation_type === 'string'
+        ? entry.hotel.accommodation_type : null,
+      match: assigned.get(entry.hotel.key) ?? emptyMatch(),
+      rates: null,
+      rates_error: null,
+    }));
+
+    // Preserve legacy optional sample pricing, but for an exact hotel
+    // selected by the user, call /api/hotels/xotelo/rates using its hotel_key.
+    for (const hotel of hotels.slice(0, pricedLimit)) {
+      try {
+        const payload = await fetchXoteloForMatching('/rates', new URLSearchParams({
+          hotel_key: hotel.hotel_key,
+          chk_in: checkIn as string,
+          chk_out: checkOut as string,
+          currency: 'GBP', rooms: '1', adults: '2',
+        }), 5 * 60 * 1000);
+        const raw = Array.isArray(payload.result.rates)
+          ? payload.result.rates as { name?: unknown; rate?: unknown }[] : [];
+        const offers = raw
+          .filter((r) => typeof r.name === 'string' && typeof r.rate === 'number' &&
+            Number.isFinite(r.rate) && r.rate > 0)
+          .map((r) => ({ provider: r.name as string, price_per_room_per_night_gbp: r.rate as number }))
+          .sort((a, b) => a.price_per_room_per_night_gbp - b.price_per_room_per_night_gbp);
+        hotel.rates = {
+          currency: 'GBP', chk_in: checkIn as string, chk_out: checkOut as string,
+          offers, lowest_price_per_room_per_night_gbp: offers[0]?.price_per_room_per_night_gbp ?? null,
+          quoted_at: typeof payload.timestamp === 'number' ? payload.timestamp : null,
+          note: 'Per-room-per-night OTA quotes, not a booking confirmation; taxes may be excluded.',
+        };
+      } catch (error) {
+        hotel.rates_error = error instanceof Error ? error.message : 'Hotel rates unavailable';
+      }
+    }
+
+    // Hide probable duplicates of Xotelo hotels from the OSM-only cards.
+    // This never links an uncertain OSM record to a paid quote.
+    const osmOnly: (OSMHotel & { hotel_key: null; price_status: 'unavailable' })[] = [];
+    let duplicateSuppressed = 0;
+    for (const osm of fallbackRows.rows) {
+      const alreadyLinked = usedOSM.has(osmIdentity(osm));
+      const likelySameListing = candidates.some((entry) => {
+        const distance = geoDistanceM(osm.latitude, osm.longitude, entry.latitude, entry.longitude);
+        const similarity = hotelSimilarity(osm.name, entry.hotel.name);
+        return distance <= 35 && similarity.matched >= 2 && similarity.shorterCoverage === 1 &&
+          similarity.score >= 0.60;
+      });
+      const duplicateOSM = osmOnly.some((prior) =>
+        normaliseHotelName(prior.name) === normaliseHotelName(osm.name) &&
+        geoDistanceM(prior.latitude, prior.longitude, osm.latitude, osm.longitude) <= 20);
+      if (alreadyLinked || likelySameListing || duplicateOSM) {
+        duplicateSuppressed++;
+        continue;
+      }
+      osmOnly.push({ ...osm, hotel_key: null, price_status: 'unavailable' });
+      if (osmOnly.length >= limit) break;
+    }
+
+    res.json({
+      success: true,
+      source: locationKey ? ['Xotelo', 'OpenStreetMap'] : ['OpenStreetMap'],
+      query: {
+        city: city || null,
+        location_key: typeof locationKey === 'string' ? locationKey : null,
+        lat, lon, radius_m: radius, limit,
+        pages_requested: pages, pages_read: pagesRead, priced_limit: pricedLimit,
+      },
+      coverage: {
+        xotelo_city_total: totalAvailable,
+        listings_scanned: collected.length,
+        nearby_xotelo_candidates: candidates.length,
+        returned: hotels.length,
+        osm_matched: hotels.filter((h) => h.match.status === 'confirmed').length,
+        osm_possible: hotels.filter((h) => h.match.status === 'possible').length,
+        scan_limited: totalAvailable !== null && collected.length < totalAvailable,
+        partial_scan_warning: pageWarning,
+        osm_only_count: osmOnly.length,
+        suppressed_duplicate_cards: duplicateSuppressed,
+        xotelo_key_available: typeof locationKey === 'string',
+      },
+      hotels,
+      osm_only: osmOnly,
+      note: typeof locationKey !== 'string'
+        ? 'OSM hotel discovery works for this UK location. Xotelo rates require a verified TripAdvisor location_key or individual hotel_key.'
+        : 'Only confirmed associations are linked to OSM. Possible matches need review; Xotelo price quotes always use the returned Xotelo hotel_key. The city hotel list scan is limited by pages.',
+    });
+  } catch (error) {
+    console.error('Unified hotel matching failed:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Unable to complete hotel matching',
+    });
+  }
+});
+
+// =====================================================
+// START
+// =====================================================
+app.use((req, res) => {
+  res.status(404).json({ success: false, error: 'Endpoint not found', path: req.path });
+});
+
+async function start(): Promise<void> {
+  try {
+    await pool.query('SELECT 1');
+    app.listen(PORT, () => {
+      console.log('-------------------------------------');
+      console.log(`MileMosaic Backend: http://localhost:${PORT}`);
+      console.log('PostgreSQL connected successfully');
+      console.log('PLACES: /health, /api/cities, /api/attractions, /api/nearby');
+      console.log('TRANSPORT: /api/transport/stops, /journey, /bus/departures, /rail/stations, /rail/departures');
+      console.log('HOTELS: /api/hotels/xotelo/list, /api/hotels/xotelo/rates, /api/hotels/matched');
+      console.log('-------------------------------------');
+    });
+  } catch (error) {
+    console.error('Database connection failed:', error);
+    process.exit(1);
+  }
+}
+
+void start();

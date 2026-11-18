@@ -1,0 +1,706 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  ActivityIndicator, Alert, Image, Keyboard, Linking, Platform,
+  Pressable, SafeAreaView, ScrollView, StatusBar, StyleSheet,
+  Text, TextInput, View,
+} from 'react-native';
+import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from 'react-native-maps';
+
+// Local Android emulator: adb reverse tcp:3001 tcp:3001
+const API_HOSTS = Platform.OS === 'android'
+  ? ['http://localhost:3001', 'http://10.0.2.2:3001']
+  : ['http://localhost:3001'];
+let selectedHost = API_HOSTS[0];
+const P = { navy:'#17323A', teal:'#087F78', lime:'#DCF57E', bg:'#F6F8F5', white:'#FFFFFF',
+  muted:'#637A83', line:'#E3E9E5', mint:'#E9F5F0', peach:'#FFF0E4', blue:'#E9F0FF',
+  purple:'#6A58CA', warn:'#A05C12', red:'#B42318', green:'#17755D' };
+
+type Coord = {latitude:number; longitude:number};
+type City = Coord & {name:string; place_type:string};
+type Location = Coord & {name:string; category?:string};
+type Kind = 'attraction' | 'restaurant' | 'hotel';
+type Place = Coord & {id:string; name:string; kind:Kind; category:string; distance?:number;
+  image?:string; imagePage?:string; cuisine?:string; vegetarian?:string; vegan?:string;
+  rating?:number; hotelKey?:string; match?:string; openingHours?:string};
+type Rate = {name:string; rate:number};
+type Leg = {mode?:string; transit?:boolean; duration_s?:number; distance_m?:number;
+  from?:{name?:string;latitude?:number;longitude?:number};
+  to?:{name?:string;latitude?:number;longitude?:number};
+  route?:{line?:string;short_name?:string;long_name?:string};
+  line?:{short_name?:string;name?:string};
+  route_short_name?:string; headsign?:string; leg_geometry?:string; leg_geometry_source?:string};
+type Itinerary = {duration_s?:number;start_time?:string;end_time?:string;
+  fare?:{amount_gbp?:number;complete?:boolean}|null; legs?:Leg[]};
+type Option = {id:string;label:string;icon:string;minutes:number;fare:number|null;
+  complete:boolean;transfers:number;legs:Leg[];kind:'transit'|'walk'|'bicycle'; start?:string};
+type Journey = {from:Location;to:Location;options:Option[];best:string;selected:string;
+  routeError?:string};
+
+const params = (p:Record<string,string|number>) => Object.entries(p)
+  .map(([k,v])=>`${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`).join('&');
+const money=(v:number)=>`£${v.toFixed(2)}`;
+const errString=(e:unknown)=>e instanceof Error?e.message:String(e);
+const coordOK=(v:unknown):v is Coord=>Boolean(v&&typeof v==='object'&&
+  Number.isFinite(Number((v as Coord).latitude))&&Number.isFinite(Number((v as Coord).longitude)));
+const num=(v:unknown)=>Number.isFinite(Number(v))?Number(v):NaN;
+const validDate=(s:string)=>/^\d{4}-\d{2}-\d{2}$/.test(s)&&
+  Number.isFinite(Date.parse(`${s}T00:00:00Z`))&&
+  new Date(`${s}T00:00:00Z`).toISOString().slice(0,10)===s;
+function haversine(a:Coord,b:Coord){
+  const R=6371000,rad=Math.PI/180,dLat=(b.latitude-a.latitude)*rad,dLon=(b.longitude-a.longitude)*rad;
+  const h=Math.sin(dLat/2)**2+Math.cos(a.latitude*rad)*Math.cos(b.latitude*rad)*Math.sin(dLon/2)**2;
+  return 2*R*Math.asin(Math.min(1,Math.sqrt(h)));
+}
+function normal(s:string){return s.toLowerCase().replace(/[^a-z0-9 ]/g,' ').replace(/\b(the|hotel|london|edinburgh|museum|of|at|a)\b/g,' ').replace(/\s+/g,' ').trim();}
+function placeFromOSM(raw:any,kind:Kind):Place{
+  return {id:`osm:${raw.osm_type}:${raw.osm_id}`,name:String(raw.name),kind,
+    latitude:Number(raw.latitude),longitude:Number(raw.longitude),category:String(raw.subcategory||kind),
+    distance:num(raw.distance_m),cuisine:raw.cuisine||undefined,
+    vegetarian:raw.vegetarian||undefined,vegan:raw.vegan||undefined,
+    openingHours:raw.opening_hours||undefined,match:kind==='hotel'?'osm-only':undefined};
+}
+function hotelFromX(raw:any):Place{
+  return {id:`xotelo:${raw.hotel_key}`,name:String(raw.name),kind:'hotel',category:'Hotel',
+    latitude:Number(raw.latitude),longitude:Number(raw.longitude),distance:num(raw.distance_m),
+    rating:typeof raw.rating==='number'?raw.rating:undefined,image:raw.image||undefined,
+    hotelKey:raw.hotel_key,match:raw.match?.status||'unmatched'};
+}
+async function api<T>(path:string):Promise<T>{
+  let message='Network error';
+  for(const host of [selectedHost,...API_HOSTS.filter(h=>h!==selectedHost)]){
+    const controller=new AbortController();
+    const timer=setTimeout(()=>controller.abort(),path.includes('matched')?48000:22000);
+    try{
+      const response=await fetch(host+path,{signal:controller.signal as unknown as RequestInit['signal']});
+      const data:any=await response.json();
+      selectedHost=host;
+      if(!response.ok||data.success===false)throw new Error(data.error||`HTTP ${response.status}`);
+      return data as T;
+    }catch(e){message=errString(e);if(!/network|fetch|abort|timeout/i.test(message))throw e;}
+    finally{clearTimeout(timer);}
+  }
+  throw new Error(`Backend inaccessible (${message}). Start npm run dev and adb reverse tcp:3001 tcp:3001.`);
+}
+// Wikipedia's published geosearch + thumbnail API, not fake attraction photos.
+async function wikipediaNearby(city:City):Promise<Place[]>{
+  const url='https://en.wikipedia.org/w/api.php?'+params({
+    action:'query',format:'json',origin:'*',generator:'geosearch',
+    ggscoord:`${city.latitude}|${city.longitude}`,ggsradius:10000,ggslimit:50,
+    prop:'coordinates|pageimages|info',inprop:'url',piprop:'thumbnail',pithumbsize:640,
+  });
+  const r=await fetch(url);if(!r.ok)throw new Error('Wikipedia photos unavailable');
+  const json:any=await r.json();
+  return Object.values(json.query?.pages||{}).flatMap((v:any):Place[]=>{
+    const lat=num(v.coordinates?.[0]?.lat),lon=num(v.coordinates?.[0]?.lon);
+    if(!v.title||!Number.isFinite(lat)||!Number.isFinite(lon)||
+       haversine(city,{latitude:lat,longitude:lon})>20000)return [];
+    return [{id:`wiki:${v.pageid}`,name:v.title,kind:'attraction',category:'Wikipedia landmark',
+      latitude:lat,longitude:lon,image:v.thumbnail?.source,
+      imagePage:v.fullurl||`https://en.wikipedia.org/wiki/${encodeURIComponent(v.title.replace(/ /g,'_'))}`}];
+  });
+}
+async function wikipediaSearch(term:string,city:City):Promise<Place[]>{
+  const url='https://en.wikipedia.org/w/api.php?'+params({action:'query',format:'json',origin:'*',
+    generator:'search',gsrsearch:term,gsrlimit:12,
+    prop:'coordinates|pageimages|info',inprop:'url',piprop:'thumbnail',pithumbsize:640});
+  const r=await fetch(url);if(!r.ok)throw new Error('Landmark search unavailable');
+  const data:any=await r.json();
+  return Object.values(data.query?.pages||{}).flatMap((v:any):Place[]=>{
+    const lat=num(v.coordinates?.[0]?.lat),lon=num(v.coordinates?.[0]?.lon);
+    if(!v.title||!Number.isFinite(lat)||!Number.isFinite(lon)||
+      haversine(city,{latitude:lat,longitude:lon})>25000)return [];
+    return [{id:`wiki:${v.pageid}`,name:v.title,kind:'attraction',category:'Wikipedia landmark',
+      latitude:lat,longitude:lon,image:v.thumbnail?.source,
+      imagePage:v.fullurl||`https://en.wikipedia.org/wiki/${encodeURIComponent(v.title.replace(/ /g,'_'))}`}];
+  });
+}
+function combineAttractions(osm:Place[],wiki:Place[]):Place[]{
+  const enriched=osm.map(o=>{
+    const match=wiki.find(w=>haversine(w,o)<350&&
+      (normal(w.name)===normal(o.name)||
+       (normal(w.name).length>3&&normal(o.name).includes(normal(w.name)))||
+       (normal(o.name).length>3&&normal(w.name).includes(normal(o.name)))));
+    return match?{...o,image:match.image,imagePage:match.imagePage}:o;
+  });
+  const extra=wiki.filter(w=>!enriched.some(o=>haversine(w,o)<250&&
+    (normal(o.name).includes(normal(w.name))||normal(w.name).includes(normal(o.name)))));
+  return [...enriched,...extra];
+}
+// Explicit search (not typing every character) on Photon's public demo geocoder.
+// Production: proxy/cache or self-host. Don't expose private TransCAPI API key in app.
+async function findUKStart(text:string):Promise<Location[]>{
+  const url=`https://photon.komoot.io/api/?${params({q:text,limit:12,lang:'en'})}`;
+  const r=await fetch(url);if(!r.ok)throw new Error(`Location search unavailable (HTTP ${r.status})`);
+  const json:any=await r.json();
+  const found=(json.features||[]).flatMap((f:any):Location[]=>{
+    const x=num(f.geometry?.coordinates?.[0]),y=num(f.geometry?.coordinates?.[1]);
+    const p=f.properties||{};
+    if(!Number.isFinite(x)||!Number.isFinite(y)||
+      (p.countrycode&&String(p.countrycode).toLowerCase()!=='gb')||
+      x < -9||x > 3||y <49||y >60)return [];
+    const name=[p.name,p.city||p.county,p.state].filter(Boolean).join(', ');
+    return name?[{name,latitude:y,longitude:x,category:p.osm_value||p.type||'Location'}]:[];
+  });
+  return found.filter((p:Location,i:number,arr:Location[])=>
+    arr.findIndex(x=>x.name===p.name&&haversine(x,p)<100)===i);
+}
+function legMode(l:Leg){return String(l.mode||'').toUpperCase();}
+function optionFrom(it:Itinerary,i:number,kind:'transit'|'walk'|'bicycle'):Option{
+  const legs=Array.isArray(it.legs)?it.legs:[];
+  const modes=legs.map(legMode).filter(x=>x&&x!=='WALK');
+  const modeNames=[...new Set(modes.map(m=>m==='BUS'||m==='COACH'?'Bus':
+    ['SUBWAY','METRO','UNDERGROUND'].includes(m)?'Tube':
+    ['RAIL','TRAIN'].includes(m)?'Train':m==='TRAM'?'Tram':m==='DLR'?'DLR':m))];
+  const line=modeNames.length?modeNames.join(' + '):'Public transport';
+  const fare=it.fare?.amount_gbp;
+  return {id:`${kind}:${i}`,label:kind==='walk'?'Walking':kind==='bicycle'?'Cycling':line,
+    icon:kind==='walk'?'🚶':kind==='bicycle'?'🚲':line==='Bus'?'🚌':line==='Tube'?'🚇':'🚆',
+    minutes:Math.max(1,Math.round(Number(it.duration_s||legs.reduce((s,l)=>s+(l.duration_s||0),0))/60)),
+    fare:kind==='walk'?0:kind==='bicycle'?null:typeof fare==='number'&&Number.isFinite(fare)?fare:null,
+    complete:kind==='walk'||it.fare?.complete===true,
+    transfers:Math.max(0,legs.filter(l=>l.transit===true||!['WALK','BICYCLE'].includes(legMode(l))).length-1),
+    legs,kind,start:it.start_time};
+}
+function decodePolyline(encoded:string):Coord[]{
+  let index=0,lat=0,lng=0;const points:Coord[]=[];
+  try{
+    while(index<encoded.length&&points.length<5000){
+      const delta=()=>{let shift=0,result=0,b=0;
+        do{if(index>=encoded.length)throw new Error('bad polyline');b=encoded.charCodeAt(index++)-63;
+          result|=(b&31)<<shift;shift+=5;}while(b>=32&&shift<35);
+        return (result&1)?~(result>>1):(result>>1);};
+      lat+=delta();lng+=delta();points.push({latitude:lat/1e5,longitude:lng/1e5});
+    }
+  }catch{return [];}
+  return points.every(p=>Math.abs(p.latitude)<=90&&Math.abs(p.longitude)<=180)?points:[];
+}
+function renderRouteCoords(opt:Option|null):Coord[][]{
+  return opt?opt.legs.map(l=>typeof l.leg_geometry==='string'?decodePolyline(l.leg_geometry):[])
+    .filter(path=>path.length>1):[];
+}
+function GoogleMode(mode:Option){return mode.kind==='walk'?'walking':mode.kind==='bicycle'?'bicycling':'transit';}
+function AppButton({title,onPress,light=false,disabled=false}:{title:string;onPress:()=>void;light?:boolean;disabled?:boolean}){
+  return <Pressable disabled={disabled} onPress={onPress} style={[s.button,light&&s.buttonLight,disabled&&{opacity:.45}]}>
+    <Text style={[s.buttonText,light&&{color:P.navy}]}>{title}</Text></Pressable>;
+}
+function Chip({title,active,onPress}:{title:string;active:boolean;onPress:()=>void}){
+  return <Pressable onPress={onPress} style={[s.chip,active&&s.chipActive]}>
+    <Text style={[s.chipText,active&&{color:P.white}]}>{title}</Text></Pressable>;
+}
+function Badge({value,kind='neutral'}:{value:string;kind?:'neutral'|'good'|'warn'}){
+  return <View style={[s.badge,kind==='good'&&{backgroundColor:'#DAF3E5'},kind==='warn'&&{backgroundColor:'#FFF1D6'}]}>
+    <Text style={[s.badgeText,kind==='good'&&{color:P.green},kind==='warn'&&{color:P.warn}]}>{value}</Text></View>;
+}
+function PanelTitle({small,title,desc}:{small:string;title:string;desc?:string}){
+  return <View style={{marginBottom:14}}><Text style={s.kicker}>{small}</Text><Text style={s.title}>{title}</Text>
+    {!!desc&&<Text style={s.muted}>{desc}</Text>}</View>;
+}
+
+export default function ExploreItineraryScreen(){
+  const [stage,setStage]=useState<'city'|'start'|'explore'>('city');
+  const [tab,setTab]=useState<'attractions'|'food'|'hotels'|'itinerary'>('attractions');
+  const [query,setQuery]=useState('');
+  const [cities,setCities]=useState<City[]>([]);
+  const [city,setCity]=useState<City|null>(null);
+  const [start,setStart]=useState<Location|null>(null);
+  const [startChoice,setStartChoice]=useState<Location|null>(null);
+  const [startInput,setStartInput]=useState('');
+  const [locationResults,setLocationResults]=useState<Location[]>([]);
+  const [pin,setPin]=useState<Coord|null>(null);
+  const [stops,setStops]=useState<Location[]>([]);
+  const [attractions,setAttractions]=useState<Place[]>([]);
+  const [hotels,setHotels]=useState<Place[]>([]);
+  const [food,setFood]=useState<Place[]>([]);
+  const [photoStatus,setPhotoStatus]=useState('');
+  const [landmarkInput,setLandmarkInput]=useState('');
+  const [cuisine,setCuisine]=useState('All');
+  const [diet,setDiet]=useState<'All'|'Vegetarian'|'Vegan'>('All');
+  const [focus,setFocus]=useState<Place|null>(null);
+  const [hotelChoice,setHotelChoice]=useState<Place|null>(null);
+  const [checkIn,setCheckIn]=useState('');
+  const [checkOut,setCheckOut]=useState('');
+  const [hotelPrices,setHotelPrices]=useState<Record<string,Rate[]>>({});
+  const [priceError,setPriceError]=useState('');
+  const [quoteBusy,setQuoteBusy]=useState(false);
+  const [plan,setPlan]=useState<Record<number,Place[]>>({});
+  const [days,setDays]=useState(3);
+  const [activeDay,setActiveDay]=useState(1);
+  const [budget,setBudget]=useState('500');
+  const [manualCosts,setManualCosts]=useState<Record<string,string>>({});
+  const [journey,setJourney]=useState<Journey|null>(null);
+  const [journeyBusy,setJourneyBusy]=useState(false);
+  const [activeLegKey,setActiveLegKey]=useState('');
+  const [busy,setBusy]=useState(false);
+  const [locationBusy,setLocationBusy]=useState(false);
+  const [error,setError]=useState('');
+  const [online,setOnline]=useState<boolean|null>(null);
+  const [showMore,setShowMore]=useState(false);
+  const request=useRef(0),routeRequest=useRef(0),priceRequest=useRef(0);
+  const cache=useRef(new Map<string,Place[]>());
+
+  useEffect(()=>{api<any>('/health').then(h=>setOnline(h.status==='ok'&&h.database==='connected')).catch(()=>setOnline(false));},[]);
+  useEffect(()=>{
+    if(stage!=='city'||query.trim().length<2){setCities([]);return;}
+    const id=++request.current;
+    const timer=setTimeout(()=>api<{cities:City[]}>(`/api/cities?search=${encodeURIComponent(query.trim())}`)
+      .then(r=>{if(request.current===id){setCities(r.cities||[]);setError('');}})
+      .catch(e=>{if(request.current===id)setError(errString(e));}),380);
+    return ()=>clearTimeout(timer);
+  },[query,stage]);
+
+  function chooseCity(c:City){
+    request.current++;routeRequest.current++;priceRequest.current++;
+    setCity(c);setCities([]);setQuery(c.name);setStage('start');Keyboard.dismiss();
+    setStartChoice({name:`${c.name} city centre`,latitude:c.latitude,longitude:c.longitude});
+    setPin(null);setLocationResults([]);setStartInput('');setStops([]);setError('');
+    setAttractions([]);setFood([]);setHotels([]);setPlan({});setHotelChoice(null);setHotelPrices({});
+    setStart(null);setFocus(null);setJourney(null);setPhotoStatus('');cache.current.clear();
+    Promise.allSettled([
+      api<any>(`/api/transport/stops?${params({lat:c.latitude,lon:c.longitude,radius:4000,limit:10})}`),
+      api<any>(`/api/transport/rail/stations?${params({lat:c.latitude,lon:c.longitude,radius:10000,limit:8})}`),
+    ]).then(values=>{
+      const suggestions:Location[]=[];
+      for(const v of values){if(v.status!=='fulfilled')continue;
+        for(const raw of v.value.data?.member||[]){const p=raw as Record<string,unknown>;
+          if(!coordOK(p))continue;
+          const row=p as Record<string,any> & Coord;
+          if(typeof row.name==='string'&&!suggestions.some(x=>x.name===row.name))
+          suggestions.push({name:row.name,latitude:Number(row.latitude),longitude:Number(row.longitude),category:String(row.type||'Stop')});}
+      }
+      setStops(suggestions.slice(0,10));
+    });
+  }
+  async function findDestination(){
+    if(query.trim().length<2){setError('Enter at least 2 letters');return;}
+    try{setBusy(true);setError('');const r=await api<{cities:City[]}>(`/api/cities?search=${encodeURIComponent(query.trim())}`);
+      const exact=r.cities.find(c=>c.name.toLowerCase()===query.trim().toLowerCase());
+      if(exact||r.cities.length===1)chooseCity(exact||r.cities[0]);
+      else if(r.cities.length)setCities(r.cities);
+      else setError('City not found. Try a different spelling.');
+    }catch(e){setError(errString(e));}finally{setBusy(false);}
+  }
+  async function searchStartingLocation(){
+    if(startInput.trim().length<3){setError('Type an airport, station, landmark or postcode.');return;}
+    try{setLocationBusy(true);setError('');const r=await findUKStart(startInput.trim());
+      setLocationResults(r);if(!r.length)setError('No UK location found. Try another name or pick the map.');
+    }catch(e){setError(errString(e));}finally{setLocationBusy(false);}
+  }
+  async function explore(){
+    if(!city||!startChoice){setError('Please select an actual starting location or map pin.');return;}
+    setStart(startChoice);setStage('explore');setTab('attractions');setError('');setShowMore(false);
+    const id=++request.current;setBusy(true);
+    try{
+      const result=await api<{places:any[]}>(`/api/attractions?${params({lat:city.latitude,lon:city.longitude,radius:18000,limit:50})}`);
+      const osm=(result.places||[]).filter(p=>p.name&&coordOK(p)).map(p=>placeFromOSM(p,'attraction'));
+      setAttractions(osm);
+      // Wikipedia enriches photos & catches missing landmark categories.
+      setPhotoStatus('Loading Wikimedia landmark photographs…');
+      wikipediaNearby(city).then(wiki=>{if(id===request.current){setAttractions(combineAttractions(osm,wiki));setPhotoStatus('Landmark photos from Wikipedia / Wikimedia Commons');}})
+      .catch(()=>{if(id===request.current)setPhotoStatus('Photos unavailable for some places; OSM results still work.');});
+    }catch(e){setError(errString(e));}finally{setBusy(false);}
+  }
+  async function searchLandmark(){
+    if(!city||landmarkInput.trim().length<2)return;
+    try{setBusy(true);setError('');const matches=await wikipediaSearch(landmarkInput.trim(),city);
+      if(!matches.length)setError('No geolocated landmark found in this city. Try a more specific name.');
+      else {setAttractions(prev=>[...matches.filter(m=>!prev.some(p=>p.id===m.id)),...prev]);setShowMore(true);}
+      Keyboard.dismiss();
+    }catch(e){setError(errString(e));}finally{setBusy(false);}
+  }
+  async function discover(kind:'food'|'hotels',near:Place|null=null){
+    if(!city)return;
+    const coords=near||city;
+    const key=[city.name,kind,coords.latitude.toFixed(4),coords.longitude.toFixed(4)].join(':');
+    const id=++request.current;setTab(kind);setFocus(near);setError('');setBusy(true);setJourney(null);
+    try{
+      let rows=cache.current.get(key);
+      if(!rows){if(kind==='food'){
+          const data=await api<{places:any[]}>(`/api/nearby?${params({lat:coords.latitude,lon:coords.longitude,radius:near?2600:6500,limit:50,type:'restaurant'})}`);
+          rows=(data.places||[]).filter(p=>p.name&&coordOK(p)).map(p=>placeFromOSM(p,'restaurant'));
+        }else{
+          const data=await api<{hotels:any[];osm_only:any[]}>(`/api/hotels/matched?${params({city:city.name,lat:coords.latitude,lon:coords.longitude,radius:near?4000:8000,limit:16,pages:2})}`);
+          rows=[...(data.hotels||[]).map(hotelFromX),...(data.osm_only||[]).filter(p=>p.name&&coordOK(p)).map(p=>placeFromOSM(p,'hotel'))];
+        }cache.current.set(key,rows);
+      }
+      if(id===request.current){kind==='food'?setFood(rows):setHotels(rows);}
+    }catch(e){if(id===request.current)setError(errString(e));}finally{if(id===request.current)setBusy(false);}
+  }
+  function toggle(place:Place){
+    if(place.kind==='hotel'){
+      setHotelChoice(old=>old?.id===place.id?null:place);setPriceError('');priceRequest.current++;
+      return;
+    }
+    setPlan(prev=>{const items=prev[activeDay]||[];return {...prev,[activeDay]:items.some(p=>p.id===place.id)
+      ?items.filter(p=>p.id!==place.id):[...items,place]};});setJourney(null);
+  }
+  async function loadHotelPrices(hotel:Place){
+    setHotelChoice(hotel);setPriceError('');
+    if(!hotel.hotelKey){setPriceError('OSM-only hotel: Xotelo price unavailable.');return;}
+    const nights=(Date.parse(`${checkOut}T00:00:00Z`)-Date.parse(`${checkIn}T00:00:00Z`))/86400000;
+    if(!validDate(checkIn)||!validDate(checkOut)||nights<1||nights>30||
+       checkIn<new Date().toISOString().slice(0,10)){
+      setPriceError('Enter future check-in and check-out dates (YYYY-MM-DD, 1–30 nights).');return;
+    }
+    const id=++priceRequest.current;setQuoteBusy(true);
+    try{const result=await api<any>(`/api/hotels/xotelo/rates?${params({hotel_key:hotel.hotelKey,chk_in:checkIn,chk_out:checkOut,currency:'GBP',rooms:1,adults:2})}`);
+      const rates:Rate[]=(result.data?.result?.rates||[]).filter((r:any)=>
+        typeof r.rate==='number'&&r.rate>0&&Number.isFinite(r.rate)&&typeof r.name==='string')
+        .sort((a:Rate,b:Rate)=>a.rate-b.rate);
+      if(id===priceRequest.current){setHotelPrices(prev=>({...prev,[hotel.id]:rates}));if(!rates.length)setPriceError('No rates returned for the selected dates.');}
+    }catch(e){if(id===priceRequest.current)setPriceError(errString(e));}
+    finally{if(id===priceRequest.current)setQuoteBusy(false);}
+  }
+  const dayItems=plan[activeDay]||[];
+  const allDays=Array.from({length:days},(_,i)=>({day:i+1,places:plan[i+1]||[]}));
+  const selectedCount=allDays.reduce((n,d)=>n+d.places.length,0);
+  const knownManualCost=allDays.reduce((acc,d)=>acc+d.places.reduce((s,p)=>{
+    const raw=manualCosts[`${d.day}:${p.id}`];const value=Number(raw);
+    return s+(raw?.trim()&&Number.isFinite(value)&&value>=0?value:0);},0),0);
+  const hotelQuote=hotelChoice?hotelPrices[hotelChoice.id]?.[0]:undefined;
+  const nights=validDate(checkIn)&&validDate(checkOut)?Math.max(0,Math.round(
+    (Date.parse(`${checkOut}T00:00:00Z`)-Date.parse(`${checkIn}T00:00:00Z`))/86400000)):0;
+  const knownTotal=knownManualCost+(hotelQuote&&nights?hotelQuote.rate*nights:0);
+  const missingCost=allDays.reduce((n,d)=>n+d.places.filter(p=>
+    !/^\d+(\.\d{1,2})?$/.test(manualCosts[`${d.day}:${p.id}`]||'')).length,0)+(hotelChoice&&!hotelQuote?1:0);
+  const cuisines=['All','Indian','Italian','Chinese','British','Asian','Pizza','Fast food','Other'];
+  const visibleFood=food.filter(p=>{
+    const value=(p.cuisine||'').toLowerCase();
+    if(cuisine!=='All'&&(cuisine==='Other'?(!value||cuisines.slice(1,-1).some(c=>value.includes(c.toLowerCase()))):!value.includes(cuisine.toLowerCase())))return false;
+    if(diet==='Vegetarian'&&!['yes','only'].includes((p.vegetarian||'').toLowerCase())&&
+       !['yes','only'].includes((p.vegan||'').toLowerCase()))return false;
+    if(diet==='Vegan'&&!['yes','only'].includes((p.vegan||'').toLowerCase()))return false;
+    return true;
+  });
+  const rankedAttractions=useMemo(()=>[...attractions].sort((a,b)=>{
+    const priority=(p:Place)=>p.category==='Wikipedia landmark'?3:/museum|castle|attraction|monument|gallery/i.test(p.category)?6:4;
+    return priority(b)-priority(a)||(b.image?1:0)-(a.image?1:0)||
+      haversine(city||a,a)-haversine(city||b,b);
+  }),[attractions,city]);
+  const displayed=tab==='attractions'?(showMore?rankedAttractions:rankedAttractions.slice(0,8)):
+    tab==='food'?visibleFood:tab==='hotels'?hotels:[];
+  const currentMap=focus||city;
+  const selectedOption=journey?.options.find(o=>o.id===journey.selected)||null;
+  const linePaths=renderRouteCoords(selectedOption);
+
+  async function compareRoute(from:Location,to:Location,key:string){
+    const id=++routeRequest.current;setActiveLegKey(key);setJourneyBusy(true);setJourney(null);setError('');
+    try{
+      const result=await api<{data?:{itineraries?:Itinerary[];alternatives?:{
+        walk?:{itineraries?:Itinerary[]};bicycle?:{itineraries?:Itinerary[]}};
+        next_available?:boolean}}>(`/api/transport/journey?${params({
+          from_lat:from.latitude,from_lon:from.longitude,to_lat:to.latitude,to_lon:to.longitude,limit:10})}`);
+      const body=result.data||{};
+      const options:Option[]=[
+        ...(body.itineraries||[]).map((x,i)=>optionFrom(x,i,'transit')),
+        ...(body.alternatives?.walk?.itineraries||[]).map((x,i)=>optionFrom(x,i,'walk')),
+        ...(body.alternatives?.bicycle?.itineraries||[]).map((x,i)=>optionFrom(x,i,'bicycle')),
+      ].filter(o=>Number.isFinite(o.minutes)&&o.minutes>0);
+      options.sort((a,b)=>a.minutes-b.minutes);
+      const best=options[0]?.id||'';
+      if(id===routeRequest.current)setJourney({from,to,options,best,selected:best,
+        routeError:body.next_available?'Next available service shown (current departure unavailable).':undefined});
+    }catch(e){if(id===routeRequest.current)setJourney({from,to,options:[],best:'',selected:'',routeError:errString(e)});}
+    finally{if(id===routeRequest.current)setJourneyBusy(false);}
+  }
+  async function openDirections(opt:Option){
+    if(!journey)return;
+    const origin=`${journey.from.latitude},${journey.from.longitude}`;
+    const destination=`${journey.to.latitude},${journey.to.longitude}`;
+    const url=`https://www.google.com/maps/dir/?${params({api:1,origin,destination,travelmode:GoogleMode(opt)})}`;
+    try{await Linking.openURL(url);}catch{Alert.alert('Directions unavailable','Unable to open Google Maps.');}
+  }
+  function itineraryLegs(day:number){
+    const places=plan[day]||[];
+    const lastPrevious=day>1?(plan[day-1]||[]).slice(-1)[0]:undefined;
+    const first=day===1?start||undefined:(hotelChoice||lastPrevious);
+    const points=[...(first?[first]:[]),...places,...(hotelChoice&&places.length?[hotelChoice]:[])];
+    return points.slice(1).map((target,i)=>({from:points[i],to:target,key:`${day}:${i}`}));
+  }
+  function placeCard(place:Place){
+    const picked=place.kind==='hotel'?hotelChoice?.id===place.id:dayItems.some(p=>p.id===place.id);
+    const isHotel=place.kind==='hotel';
+    const match=place.match==='confirmed'?'Confirmed algorithmic match':place.match==='possible'? 'Attention required · unverified match':
+      isHotel?'Cross-source information unavailable':'';
+    const rates=hotelPrices[place.id];
+    const hotelOpen=isHotel&&hotelChoice?.id===place.id;
+    return <View key={place.id} style={s.placeCard}>
+      {place.image?<Image source={{uri:place.image}} style={s.placeImage}/>:<View style={s.photoFallback}>
+        <Text style={{fontSize:27}}>{isHotel?'🏨':place.kind==='restaurant'?'🍽️':'🏛️'}</Text>
+        <Text style={s.caption}>Photograph unavailable</Text></View>}
+      <Text style={s.placeName}>{place.name}</Text>
+      <Text style={s.muted}>{place.category.replace(/_/g,' ')}{Number.isFinite(place.distance)?` · ${Math.round(place.distance!)}m away`:''}
+        {place.rating?` · ★ ${place.rating.toFixed(1)}`:''}</Text>
+      {place.imagePage&&<Pressable onPress={()=>void Linking.openURL(place.imagePage!)}>
+        <Text style={s.tinyLink}>Photo/article: Wikipedia · check image licence and attribution ↗</Text></Pressable>}
+      {isHotel?<Badge value={match} kind={place.match==='confirmed'?'good':place.match==='possible'?'warn':'neutral'}/>:
+        place.kind==='restaurant'?<Text style={s.caption}>Cuisine: {place.cuisine||'Not tagged'} · Diet: {place.vegetarian||place.vegan||'Not verified'} · Menu price unavailable</Text>:
+        <Text style={s.caption}>{place.openingHours?`OSM hours: ${place.openingHours}`:'Opening hours not verified'} · Ticket price unavailable</Text>}
+      <View style={s.buttonRow}>
+        <AppButton title={picked?isHotel?'✓ Chosen stay':'✓ Remove':isHotel?'🏨 Select / See prices':`＋ Add to Day ${activeDay}`}
+          onPress={()=>toggle(place)}/>
+        <AppButton title="Directions ↗" light onPress={()=>{
+          const origin=start||city;
+          if(origin)void compareRoute(origin,place,`card:${place.id}`);
+          setTab('itinerary');
+        }}/>
+      </View>
+      {place.kind==='attraction'&&<View style={s.inlineLinks}>
+        <Pressable onPress={()=>void discover('hotels',place)}><Text style={s.link}>🏨 Get hotels nearby</Text></Pressable>
+        <Pressable onPress={()=>void discover('food',place)}><Text style={s.link}>🍽 Get food nearby</Text></Pressable>
+      </View>}
+      {hotelOpen&&<View style={s.inlinePrice}>
+        <Text style={s.cardLabel}>HOTEL PRICING · 1 ROOM / 2 ADULTS</Text>
+        <View style={s.buttonRow}>
+          <TextInput value={checkIn} onChangeText={(v:string)=>{priceRequest.current++;setCheckIn(v);setHotelPrices({});}}
+            style={[s.input,{flex:1}]} placeholder="Check-in YYYY-MM-DD" placeholderTextColor="#87999C"/>
+          <TextInput value={checkOut} onChangeText={(v:string)=>{priceRequest.current++;setCheckOut(v);setHotelPrices({});}}
+            style={[s.input,{flex:1}]} placeholder="Check-out YYYY-MM-DD" placeholderTextColor="#87999C"/>
+        </View>
+        <AppButton title={quoteBusy?'Checking rates…':'See actual hotel prices'} disabled={quoteBusy||!place.hotelKey}
+          onPress={()=>void loadHotelPrices(place)}/>
+        {!!priceError&&<Text style={s.errorText}>{priceError}</Text>}
+        {rates?.length>0&&<View style={{marginTop:9}}>
+          <Text style={s.goodText}>From {money(rates[0].rate)} / room / night</Text>
+          {rates.slice(0,4).map((r,i)=><Text key={`${r.name}:${i}`} style={s.muted}>{r.name}: {money(r.rate)}/night</Text>)}
+          <Text style={s.caption}>Indicative quotes, not booked. Tax / fees may be excluded.</Text>
+        </View>}
+        {!place.hotelKey&&<Text style={s.caption}>OSM-only hotel: Xotelo pricing information unavailable.</Text>}
+      </View>}
+    </View>;
+  }
+  function routePanel(){
+    if(journeyBusy)return <View style={s.routeBox}><ActivityIndicator color={P.teal}/><Text style={s.muted}>Comparing public transport and other modes…</Text></View>;
+    if(!journey)return null;
+    return <View style={s.routeBox}>
+      <Text style={s.cardLabel}>ROUTE COMPARISON · LIVE PROVIDER DATA WHEN AVAILABLE</Text>
+      <Text style={s.placeName}>{journey.from.name} → {journey.to.name}</Text>
+      {!!journey.routeError&&<Text style={s.errorText}>{journey.routeError}</Text>}
+      {!journey.options.length&&<Text style={s.caption}>No routes returned. Try another time/location; no timings were invented.</Text>}
+      {journey.options.map(o=><View key={o.id} style={[s.optionRow,journey.selected===o.id&&{borderColor:P.teal,backgroundColor:P.mint}]}>
+        <Pressable style={{flex:1}} onPress={()=>setJourney(v=>v?{...v,selected:o.id}:v)}>
+          <Text style={s.placeName}>{o.icon} {o.label} · {o.minutes} min {journey.best===o.id?' · FASTEST':''}{o.fare!==null&&o.complete&&o.fare===Math.min(...journey.options.filter(x=>x.fare!==null&&x.complete).map(x=>x.fare as number))?' · LOWEST KNOWN FARE':''}</Text>
+          <Text style={s.caption}>{o.fare===null?'Fare not available':o.complete?money(o.fare):`${money(o.fare)} (partial fare)`}
+            {' · '}{o.transfers} change(s){o.start?` · departs ${new Date(o.start).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'})}`:''}</Text>
+        </Pressable>
+        <Pressable onPress={()=>setJourney(v=>v?{...v,selected:o.id}:v)}><Text style={s.link}>View</Text></Pressable>
+      </View>)}
+      {selectedOption&&<View style={{marginTop:12}}>
+        <MapView key={`${journey.from.name}:${journey.to.name}:${selectedOption.id}`} provider={PROVIDER_GOOGLE}
+          style={s.routeMap} initialRegion={{latitude:(journey.from.latitude+journey.to.latitude)/2,
+          longitude:(journey.from.longitude+journey.to.longitude)/2,
+          latitudeDelta:Math.max(.015,Math.abs(journey.from.latitude-journey.to.latitude)*1.5),
+          longitudeDelta:Math.max(.015,Math.abs(journey.from.longitude-journey.to.longitude)*1.5)}}>
+          <Marker coordinate={journey.from} title={journey.from.name} pinColor={P.teal}/>
+          <Marker coordinate={journey.to} title={journey.to.name} pinColor={P.purple}/>
+          {renderRouteCoords(selectedOption).map((coords,i)=><Polyline key={i} coordinates={coords} strokeColor={P.teal} strokeWidth={5}/>)}
+        </MapView>
+        <Text style={s.caption}>Only provider-supplied route geometry is drawn; missing segments are not invented.</Text>
+        <Text style={s.cardLabel}>DIRECTIONS FOR SELECTED OPTION</Text>
+        {selectedOption.legs.length?selectedOption.legs.map((l,i)=><View key={`${selectedOption.id}:${i}`} style={s.stepRow}>
+          <Text style={s.stepNumber}>{i+1}</Text>
+          <View style={{flex:1}}><Text style={s.placeName}>{legMode(l)||selectedOption.label}
+            {l.route?.line?` ${l.route.line}`:l.route?.short_name?` ${l.route.short_name}`:l.line?.short_name?` ${l.line.short_name}`:l.route_short_name?` ${l.route_short_name}`:''}</Text>
+            <Text style={s.muted}>{l.from?.name||'Start'} → {l.to?.name||'End'}
+              {l.duration_s?` · ${Math.round(l.duration_s/60)} min`:''}</Text>
+            {!!l.headsign&&<Text style={s.caption}>Towards: {l.headsign}</Text>}
+          </View></View>):<Text style={s.caption}>Detailed route steps not supplied for this alternative.</Text>}
+        <AppButton title={`Open ${selectedOption.label} directions in Google Maps ↗`}
+          onPress={()=>void openDirections(selectedOption)}/>
+        <Text style={s.caption}>Google Maps may choose a different service. Bus/train choice and steps above come from TransCAPI; Google Maps URL opens transit mode generally.</Text>
+      </View>}
+    </View>;
+  }
+  const mapItems=[...displayed.slice(0,25),...allDays.flatMap(d=>d.places),...(hotelChoice?[hotelChoice]:[])];
+  const mapUnique=[...new Map(mapItems.map(p=>[p.id,p])).values()];
+  const mapCentre=focus||city;
+  return <SafeAreaView style={s.root}><StatusBar barStyle="dark-content"/>
+    <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={s.content}>
+      <View style={s.brandRow}><View style={s.brandLogo}><Text style={{fontSize:23,color:P.lime}}>✦</Text></View>
+        <View style={{flex:1}}><Text style={s.brand}>MileMosaic<Text style={{color:P.teal}}>.</Text></Text>
+          <Text style={s.micro}>EXPLORE · TRAVEL · PLAN</Text></View>
+        <Badge value={online===null?'Connecting':online?'● API online':'● API offline'} kind={online?'good':'warn'}/></View>
+      <View style={s.hero}><Text style={s.heroSmall}>✦ DISCOVER THE UK</Text>
+        <Text style={s.heroTitle}>{stage==='city'?'Where shall we\ngo next?':stage==='start'?'Where does your\njourney begin?':`Explore ${city?.name||'the UK'}`}</Text>
+        <Text style={s.heroSub}>Real attractions · nearby stays · cuisine-based food · transport comparisons</Text>
+        <Text style={s.heroStep}>{stage==='city'?'01 / DESTINATION':stage==='start'?'02 / START LOCATION':'03 / EXPLORE & PLAN'}</Text></View>
+      {stage==='city'&&<View style={s.panel}>
+        <PanelTitle small="DESTINATION" title="Choose your city" desc="Search the UK cities in your local OSM/PostgreSQL database."/>
+        <TextInput style={s.input} value={query} onChangeText={setQuery} placeholder="London, Leicester, Edinburgh…"
+          placeholderTextColor="#889A9D" onSubmitEditing={()=>void findDestination()} returnKeyType="search" autoCorrect={false}/>
+        {cities.map(c=><Pressable key={`${c.name}:${c.latitude}`} style={s.result} onPress={()=>chooseCity(c)}>
+          <Text style={s.placeName}>📍 {c.name}</Text><Text style={s.muted}>{c.place_type} →</Text></Pressable>)}
+        <AppButton title="Find my destination →" disabled={busy} onPress={()=>void findDestination()}/>
+      </View>}
+      {stage==='start'&&city&&<View style={s.panel}>
+        <PanelTitle small="STARTING LOCATION" title="Pick an airport, station or address"
+          desc="You can start at Gatwick even if your destination is Leicester. Search anywhere in Great Britain, or tap the map."/>
+        <Pressable style={[s.result,startChoice?.name===`${city.name} city centre`&&s.selected]}
+          onPress={()=>setStartChoice({name:`${city.name} city centre`,latitude:city.latitude,longitude:city.longitude})}>
+          <Text style={s.placeName}>🏙 {city.name} city centre</Text><Text style={s.link}>Select</Text></Pressable>
+        <Text style={s.cardLabel}>SEARCH AIRPORTS / RAILWAY / BUS STATIONS UK-WIDE</Text>
+        <TextInput style={s.input} value={startInput} onChangeText={setStartInput}
+          placeholder="e.g. Gatwick Airport, Kings Cross, postcode" placeholderTextColor="#87999C"
+          onSubmitEditing={()=>void searchStartingLocation()} returnKeyType="search"/>
+        <AppButton title={locationBusy?'Searching…':'Search locations →'} disabled={locationBusy}
+          onPress={()=>void searchStartingLocation()}/>
+        {locationResults.map((loc,i)=><Pressable key={`${loc.name}:${i}`} style={[s.result,startChoice?.name===loc.name&&s.selected]}
+          onPress={()=>{setStartChoice(loc);Keyboard.dismiss();}}>
+          <Text style={s.placeName}>📍 {loc.name}</Text><Text style={s.muted}>{loc.category||'Location'} · Select</Text></Pressable>)}
+        {!!stops.length&&<><Text style={s.cardLabel}>NEAR YOUR DESTINATION</Text>
+          {stops.slice(0,5).map((loc,i)=><Pressable key={`${loc.name}:${i}`} style={[s.result,startChoice?.name===loc.name&&s.selected]}
+            onPress={()=>setStartChoice(loc)}><Text style={s.placeName}>🚉 {loc.name}</Text><Text style={s.link}>Select</Text></Pressable>)}</>}
+        <Text style={s.cardLabel}>OR TAP THE GOOGLE MAP</Text>
+        <MapView provider={PROVIDER_GOOGLE} style={s.startMap} initialRegion={{latitude:city.latitude,longitude:city.longitude,
+          latitudeDelta:.12,longitudeDelta:.12}} onPress={(e:{nativeEvent:{coordinate:Coord}})=>{
+            const point=e.nativeEvent.coordinate;setPin(point);setStartChoice({...point,name:'Selected map pin'});}}>
+          <Marker coordinate={pin||city} pinColor={P.teal} title={startChoice?.name||'Starting point'}/></MapView>
+        {!!startChoice&&<Badge value={`✓ Selected: ${startChoice.name}`} kind="good"/>}
+        <View style={s.buttonRow}><AppButton title="← Change city" light onPress={()=>setStage('city')}/>
+          <AppButton title="Explore attractions →" disabled={!startChoice} onPress={()=>void explore()}/></View>
+        <Text style={s.caption}>Location lookup: OSM Photon public demo (limited usage). Production deployment needs a supported geocoding provider.</Text>
+      </View>}
+      {stage==='explore'&&city&&<>
+        <View style={s.tripStrip}><View style={{flex:1}}><Text style={s.micro}>YOUR TRIP</Text>
+          <Text style={s.placeName}>📍 {city.name}</Text><Text style={s.muted}>From: {start?.name||'Not selected'}</Text></View>
+          <Pressable onPress={()=>setStage('start')}><Text style={s.link}>Edit start ↗</Text></Pressable></View>
+        <View style={s.panel}>
+          <View style={s.tabBar}>{(['attractions','food','hotels','itinerary'] as const).map(t=><Chip key={t}
+            title={t==='attractions'?'✦ Sights':t==='food'?'🍽 Food':t==='hotels'?'🏨 Hotels':'🗓 Trip'}
+            active={tab===t} onPress={()=>{
+              if(t==='hotels')void discover('hotels');else if(t==='food')void discover('food');
+              else {setTab(t);setFocus(null);setError('');}}}/>)}</View>
+          <View style={s.buttonRow}><View style={{flex:1}}><Text style={s.cardLabel}>DAYS</Text><View style={s.counter}>
+            <Pressable onPress={()=>{if(days>1&&!plan[days]?.length){setDays(days-1);setActiveDay(d=>Math.min(d,days-1));}}}>
+              <Text style={s.plus}>−</Text></Pressable><Text style={s.placeName}>{days}</Text>
+            <Pressable onPress={()=>setDays(Math.min(7,days+1))}><Text style={s.plus}>＋</Text></Pressable></View></View>
+            <View style={{flex:1}}><Text style={s.cardLabel}>BUDGET £</Text>
+              <TextInput style={s.input} value={budget} onChangeText={setBudget} keyboardType="decimal-pad" placeholder="500"/></View></View>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{gap:7,marginTop:10}}>
+            {allDays.map(d=><Chip key={d.day} title={`Day ${d.day} · ${d.places.length}`} active={d.day===activeDay}
+              onPress={()=>{setActiveDay(d.day);setJourney(null);}}/>)}</ScrollView>
+          {tab!=='itinerary'&&mapCentre&&<><MapView key={`${city.name}:${tab}:${focus?.id||'city'}`}
+            provider={PROVIDER_GOOGLE} style={s.exploreMap} initialRegion={{latitude:mapCentre.latitude,longitude:mapCentre.longitude,
+              latitudeDelta:focus ? .023 : .07,longitudeDelta:focus ? .023 : .07}}>
+            {!!start&&<Marker coordinate={start} pinColor={P.teal} title={`Start: ${start.name}`}/>}
+            {mapUnique.slice(0,35).filter(coordOK).map(p=><Marker key={p.id} coordinate={p} title={p.name}
+              pinColor={p.kind==='hotel'?P.purple:p.kind==='restaurant'?'#ED8559':P.teal}/>)}
+            {linePaths.map((path,i)=><Polyline key={i} coordinates={path} strokeColor={P.teal} strokeWidth={5}/>)}
+          </MapView><Text style={s.caption}>Map markers are from returned coordinates. Routes are only drawn if the provider supplies geometry.</Text></>}
+        </View>
+        {tab==='attractions'&&<View style={s.panel}>
+          <PanelTitle small="REAL TOURIST LANDMARKS" title="What should we visit?"
+            desc="OSM nearby places plus Wikipedia landmarks/photos; no fake ticket prices or ratings."/>
+          <View style={s.buttonRow}><TextInput style={[s.input,{flex:1}]} value={landmarkInput}
+            onChangeText={setLandmarkInput} placeholder="Find Big Ben, London Eye…" placeholderTextColor="#889A9D"
+            onSubmitEditing={()=>void searchLandmark()}/>
+            <AppButton title="Find" onPress={()=>void searchLandmark()}/></View>
+          {!!photoStatus&&<Text style={s.caption}>{photoStatus}</Text>}
+          {busy&&<ActivityIndicator color={P.teal} style={{margin:14}}/>}
+          {displayed.map(placeCard)}
+          {rankedAttractions.length>8&&!showMore&&<AppButton light title="Show more attractions ↓" onPress={()=>setShowMore(true)}/>}
+        </View>}
+        {tab==='food'&&<View style={s.panel}>
+          <PanelTitle small="CUISINE-BASED DISCOVERY" title="What would you like to eat?"
+            desc={focus?`Food near ${focus.name}`:'Food near the city centre. OSM tags control the cuisine filters.'}/>
+          {!!focus&&<AppButton light title="Clear attraction filter" onPress={()=>void discover('food')}/>}
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{gap:7,marginBottom:11}}>
+            {cuisines.map(c=><Chip key={c} title={c} active={cuisine===c} onPress={()=>setCuisine(c)}/>)}</ScrollView>
+          <View style={s.tabBar}>{(['All','Vegetarian','Vegan'] as const).map(d=><Chip key={d} title={d}
+            active={diet===d} onPress={()=>setDiet(d)}/>)}</View>
+          {busy&&<ActivityIndicator color={P.teal} style={{margin:14}}/>}
+          {!busy&&!visibleFood.length&&<Text style={s.muted}>No restaurants with these OSM tags in this area. Try All food or a different location.</Text>}
+          {visibleFood.map(placeCard)}
+        </View>}
+        {tab==='hotels'&&<View style={s.panel}>
+          <PanelTitle small="YOUR ACCOMMODATION" title="Hotels & live quotes"
+            desc={focus?`Nearby stays: ${focus.name}`:'Select a hotel to see its pricing inside the same card.'}/>
+          {!!focus&&<AppButton light title="Show hotels around city" onPress={()=>void discover('hotels')}/>}
+          {busy&&<ActivityIndicator color={P.teal} style={{margin:14}}/>}
+          {hotels.map(placeCard)}
+        </View>}
+        {tab==='itinerary'&&<View style={s.panel}>
+          <PanelTitle small="DAY-WISE TRAVEL PLAN" title="Places, routes & spending"
+            desc="Use the route comparison between actual saved places; times and modes come from TransCAPI."/>
+          <View style={s.startRow}><Text style={s.placeName}>🚩 Starting: {start?.name||'Not selected'}</Text></View>
+          {allDays.map(d=><View key={d.day} style={s.dayBox}>
+            <View style={s.result}><Text style={s.placeName}>DAY {d.day}</Text><Text style={s.muted}>{d.places.length} stops</Text></View>
+            {!d.places.length&&<Text style={s.caption}>No places selected for this day.</Text>}
+            {d.places.map((p,i)=><View key={p.id} style={s.dayItem}>
+              <Text style={s.stepNumber}>{i+1}</Text><View style={{flex:1}}><Text style={s.placeName}>{p.name}</Text>
+                <Text style={s.muted}>{p.kind} · {p.category} · Price unavailable unless entered</Text>
+                <TextInput value={manualCosts[`${d.day}:${p.id}`]||''} keyboardType="decimal-pad"
+                  onChangeText={(v:string)=>setManualCosts(prev=>({...prev,[`${d.day}:${p.id}`]:v}))}
+                  placeholder="Manual spending estimate £" placeholderTextColor="#88999C" style={s.input}/>
+                <Pressable onPress={()=>{setActiveDay(d.day);setPlan(prev=>({...prev,[d.day]:(prev[d.day]||[]).filter(x=>x.id!==p.id)}));}}>
+                  <Text style={s.tinyLink}>Remove place</Text></Pressable></View></View>)}
+            {itineraryLegs(d.day).map(leg=><View key={leg.key} style={{marginTop:10}}>
+              <Text style={s.muted}>↗ {leg.from.name} → {leg.to.name}</Text>
+              <AppButton title="Compare bus / train / walk options" light
+                onPress={()=>void compareRoute(leg.from,leg.to,leg.key)}/>
+              {activeLegKey===leg.key&&routePanel()}
+            </View>)}
+          </View>)}
+          {activeLegKey.startsWith('card:')&&routePanel()}
+          <View style={s.startRow}><Text style={s.placeName}>🏨 Stay: {hotelChoice?.name||'Not selected'}</Text></View>
+          {!!hotelChoice&&<Text style={s.muted}>{hotelQuote?`From ${money(hotelQuote.rate)}/night · ${nights} nights`:'Price not checked / unavailable'}</Text>}
+          <View style={s.budgetBox}><Text style={s.heroSmall}>KNOWN / USER-ENTERED SPEND</Text>
+            <Text style={s.total}>{money(knownTotal)}</Text>
+            <Text style={s.heroSub}>Budget: {Number.isFinite(Number(budget))?money(Number(budget)):'Not set'} · {missingCost} missing price(s)</Text>
+            <Text style={s.caption}>Incomplete total: no assumptions about tickets, meals, transport or unquoted hotel rates.</Text></View>
+          <View style={s.buttonRow}><AppButton light title="＋ Attractions" onPress={()=>setTab('attractions')}/>
+            <AppButton title="🍽 Get food" onPress={()=>void discover('food')}/></View>
+        </View>}
+      </>}
+      {!!error&&<View style={s.errorBox}><Text style={s.errorText}>{error}</Text></View>}
+      <Text style={s.footer}>MileMosaic · OSM / Wikipedia / Xotelo / TransCAPI · Check provider terms & attribution</Text>
+    </ScrollView>
+  </SafeAreaView>;
+}
+
+const s=StyleSheet.create({
+  root:{flex:1,backgroundColor:P.bg},content:{padding:16,paddingTop:Platform.OS==='android'?24:12,paddingBottom:70},
+  brandRow:{flexDirection:'row',alignItems:'center',gap:11,marginBottom:17},brandLogo:{height:43,width:43,borderRadius:15,
+    backgroundColor:P.navy,alignItems:'center',justifyContent:'center'},brand:{fontSize:20,fontWeight:'900',color:P.navy},
+  micro:{fontSize:9,color:P.muted,fontWeight:'800',letterSpacing:1.1,marginTop:2},
+  hero:{backgroundColor:P.navy,padding:23,borderRadius:24,marginBottom:16},heroSmall:{fontSize:10,fontWeight:'900',
+    letterSpacing:1.25,color:P.lime,marginBottom:9},heroTitle:{fontSize:30,fontWeight:'900',lineHeight:36,color:P.white},
+  heroSub:{fontSize:12,color:'#BBD1D4',lineHeight:19,marginTop:9},heroStep:{color:P.lime,fontSize:10,
+    marginTop:15,fontWeight:'900',letterSpacing:1.1},panel:{backgroundColor:P.white,borderRadius:21,padding:15,
+    borderWidth:1,borderColor:P.line,marginBottom:14},kicker:{fontSize:10,fontWeight:'900',letterSpacing:1.1,
+    color:P.teal,marginBottom:5},title:{fontSize:20,fontWeight:'900',color:P.navy,marginBottom:4},
+  muted:{fontSize:11,color:P.muted,lineHeight:17,marginTop:4},caption:{fontSize:10,color:P.muted,
+    lineHeight:16,marginTop:7},input:{borderWidth:1,borderColor:'#D7E2DF',borderRadius:12,paddingVertical:9,
+    paddingHorizontal:10,minHeight:43,color:P.navy,fontSize:12,backgroundColor:'#FCFDFD'},
+  button:{backgroundColor:P.navy,paddingVertical:11,paddingHorizontal:13,borderRadius:11,
+    minHeight:42,alignItems:'center',justifyContent:'center',flexShrink:1,marginTop:7},
+  buttonLight:{backgroundColor:P.lime},buttonText:{fontSize:11,fontWeight:'900',color:P.white,textAlign:'center'},
+  buttonRow:{flexDirection:'row',alignItems:'center',gap:8,marginTop:8,flexWrap:'wrap'},result:{paddingVertical:12,
+    borderBottomWidth:1,borderBottomColor:P.line,flexDirection:'row',alignItems:'center',justifyContent:'space-between',gap:8},
+  selected:{borderColor:P.teal,backgroundColor:P.mint},placeName:{fontSize:13,fontWeight:'900',color:P.navy,flexShrink:1},
+  link:{fontSize:11,fontWeight:'900',color:P.teal},tinyLink:{fontSize:10,color:P.teal,fontWeight:'800',marginTop:7},
+  badge:{backgroundColor:'#EFF3F2',paddingVertical:5,paddingHorizontal:8,borderRadius:9,alignSelf:'flex-start',marginTop:7},
+  badgeText:{fontSize:10,fontWeight:'800',color:P.muted},cardLabel:{fontSize:10,fontWeight:'900',letterSpacing:.65,
+    color:P.muted,marginTop:15,marginBottom:7},startMap:{height:230,marginTop:9,borderRadius:15},
+  tripStrip:{backgroundColor:P.mint,flexDirection:'row',alignItems:'center',padding:13,borderRadius:17,
+    marginBottom:13,gap:10},tabBar:{flexDirection:'row',gap:6,flexWrap:'wrap',marginBottom:10},
+  chip:{backgroundColor:'#EFF3F1',paddingHorizontal:10,paddingVertical:9,borderRadius:11},
+  chipActive:{backgroundColor:P.navy},chipText:{color:P.navy,fontSize:10,fontWeight:'800'},
+  counter:{borderWidth:1,borderColor:P.line,borderRadius:11,minHeight:43,paddingHorizontal:9,flexDirection:'row',
+    alignItems:'center',justifyContent:'space-between'},plus:{fontSize:19,fontWeight:'900',color:P.teal},
+  exploreMap:{height:240,borderRadius:15,marginTop:10},placeCard:{borderWidth:1,borderColor:P.line,
+    borderRadius:16,padding:12,marginVertical:7},placeImage:{width:'100%',height:140,borderRadius:12,marginBottom:9},
+  photoFallback:{height:90,borderRadius:12,backgroundColor:'#EDF4EF',justifyContent:'center',alignItems:'center',
+    marginBottom:9},inlineLinks:{flexDirection:'row',flexWrap:'wrap',gap:15,marginTop:12},
+  inlinePrice:{padding:12,borderRadius:12,backgroundColor:P.blue,marginTop:12},goodText:{fontSize:14,
+    fontWeight:'900',color:P.green},errorBox:{backgroundColor:'#FFF0EF',padding:14,borderRadius:13,marginBottom:12},
+  errorText:{color:P.red,fontSize:11,lineHeight:17,marginTop:7},dayBox:{borderBottomWidth:1,
+    borderBottomColor:P.line,paddingBottom:14,marginBottom:11},dayItem:{flexDirection:'row',gap:9,marginTop:11},
+  stepNumber:{backgroundColor:P.navy,color:P.lime,fontWeight:'900',overflow:'hidden',borderRadius:7,
+    paddingVertical:5,paddingHorizontal:8,alignSelf:'flex-start',fontSize:11},routeBox:{padding:12,
+    backgroundColor:'#F4F8F5',borderRadius:13,marginTop:10},optionRow:{borderWidth:1,borderColor:P.line,
+    borderRadius:10,padding:10,flexDirection:'row',alignItems:'center',gap:10,marginVertical:5},
+  stepRow:{flexDirection:'row',gap:10,marginVertical:9},routeMap:{height:210,borderRadius:13,marginVertical:10},startRow:{backgroundColor:P.mint,borderRadius:12,
+    padding:12,marginVertical:10},budgetBox:{backgroundColor:P.navy,padding:16,borderRadius:16,marginTop:14},
+  total:{color:P.lime,fontSize:31,fontWeight:'900'},footer:{fontSize:10,color:'#9AA9A7',textAlign:'center',
+    marginTop:10},
+});

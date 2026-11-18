@@ -1,0 +1,3210 @@
+
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  ActivityIndicator,
+  Alert,
+  Image,
+  Keyboard,
+  Linking,
+  Platform,
+  Pressable,
+  SafeAreaView,
+  ScrollView,
+  StatusBar,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
+
+import MapView, {
+  Marker,
+  PROVIDER_GOOGLE,
+  type Region,
+} from 'react-native-maps';
+
+// Android emulator can access Mac through 10.0.2.2.
+// adb reverse allows localhost:3001 on Android.
+// Try both to avoid silent connection failures.
+const API_HOSTS =
+  Platform.OS === 'android'
+    ? ['http://localhost:3001', 'http://10.0.2.2:3001']
+    : ['http://localhost:3001'];
+
+let workingApiHost = API_HOSTS[0];
+
+const BLUE = '#2563EB';
+const NAVY = '#172033';
+const BG = '#F8FAFC';
+const GREEN = '#15803D';
+const AMBER = '#B45309';
+const BORDER = '#E2E8F0';
+const DAYS_LIMIT = 7;
+
+type Category = 'attraction' | 'restaurant' | 'hotel';
+
+type MatchStatus =
+  | 'confirmed'
+  | 'possible'
+  | 'unmatched'
+  | 'osm-only';
+
+type City = {
+  name: string;
+  place_type: string;
+  latitude: number;
+  longitude: number;
+};
+
+type OsmPlace = {
+  osm_id: string | number;
+  osm_type: string;
+  name: string;
+  category: string;
+  subcategory: string;
+  latitude: number;
+  longitude: number;
+  distance_m?: number;
+  cuisine?: string | null;
+  vegetarian?: string | null;
+  vegan?: string | null;
+  opening_hours?: string | null;
+};
+
+type XoteloHotel = {
+  hotel_key: string;
+  name: string;
+  latitude: number;
+  longitude: number;
+  distance_m?: number;
+  rating?: number | null;
+  image?: string | null;
+  match?: {
+    status?: 'confirmed' | 'possible' | 'unmatched';
+  };
+};
+
+type Place = {
+  id: string;
+  title: string;
+  kind: Category;
+  latitude: number;
+  longitude: number;
+  distanceM?: number;
+  subtitle: string;
+  image?: string;
+  rating?: number;
+  hotelKey?: string;
+  matchStatus?: MatchStatus;
+  cuisine?: string;
+  vegetarian?: string;
+  vegan?: string;
+};
+
+type DayPlan = {
+  attractions: Place[];
+  restaurants: Place[];
+};
+
+type Quote = {
+  lowest: number;
+  provider: string;
+  checkIn: string;
+  checkOut: string;
+  nights: number;
+};
+
+const makeEmptyDay = (): DayPlan => ({
+  attractions: [],
+  restaurants: [],
+});
+
+const gbp = (n: number) => `£${n.toFixed(2)}`;
+
+const validDate = (s: string) =>
+  /^\d{4}-\d{2}-\d{2}$/.test(s) &&
+  !Number.isNaN(Date.parse(`${s}T00:00:00Z`)) &&
+  new Date(`${s}T00:00:00Z`).toISOString().slice(0, 10) === s;
+
+const nightsBetween = (a: string, b: string) =>
+  Math.round(
+    (Date.parse(`${b}T00:00:00Z`) -
+      Date.parse(`${a}T00:00:00Z`)) /
+      86400000,
+  );
+
+// Fetch from Express backend.
+// If one Android host fails, try the other.
+// Display real API errors instead of silently returning empty data.
+async function getJson<T>(
+  path: string,
+  signal?: AbortSignal,
+): Promise<T> {
+  const hosts = [
+    workingApiHost,
+    ...API_HOSTS.filter(h => h !== workingApiHost),
+  ];
+
+  let lastError: Error | null = null;
+
+  for (const host of hosts) {
+    if (signal?.aborted) {
+      throw new Error('Request cancelled');
+    }
+
+    const controller = new AbortController();
+
+    const isCityOrHealth =
+      path.startsWith('/api/cities') || path === '/health';
+
+    const timeout = setTimeout(
+      () => controller.abort(),
+      isCityOrHealth ? 6500 : 45000,
+    );
+
+    const abort = () => controller.abort();
+
+    signal?.addEventListener('abort', abort);
+
+    try {
+      const response = await fetch(`${host}${path}`, {
+        signal: controller.signal,
+      });
+
+      const json = await response.json();
+
+      if (!response.ok || json?.success === false) {
+        workingApiHost = host;
+
+        throw new Error(
+          json?.error ||
+            `Backend returned HTTP ${response.status}`,
+        );
+      }
+
+      workingApiHost = host;
+
+      return json as T;
+    } catch (e) {
+      const message =
+        e instanceof Error ? e.message : String(e);
+
+      if (signal?.aborted) {
+        throw new Error('Request cancelled');
+      }
+
+      const isNetworkError =
+        message.toLowerCase().includes('network') ||
+        message.toLowerCase().includes('fetch') ||
+        message.toLowerCase().includes('abort') ||
+        message.toLowerCase().includes('timeout');
+
+      if (
+        message.startsWith('Backend returned HTTP') ||
+        !isNetworkError
+      ) {
+        throw new Error(message);
+      }
+
+      lastError = new Error(
+        `${host}: ${
+          controller.signal.aborted ? 'timed out' : message
+        }`,
+      );
+    } finally {
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', abort);
+    }
+  }
+
+  throw new Error(
+    `Cannot reach Express on port 3001. ${
+      lastError?.message || ''
+    }. Start backend: npm run dev. ` +
+      'For Android USB run: adb reverse tcp:3001 tcp:3001.',
+  );
+}
+
+// Convert OSM API response into frontend place.
+const fromOSM = (
+  item: OsmPlace,
+  kind: Category,
+): Place => ({
+  id: `osm:${item.osm_type}:${item.osm_id}`,
+  title: item.name,
+  kind,
+  latitude: Number(item.latitude),
+  longitude: Number(item.longitude),
+  distanceM: item.distance_m,
+  subtitle: (item.subcategory || kind).replace(/_/g, ' '),
+  matchStatus: kind === 'hotel' ? 'osm-only' : undefined,
+  cuisine: item.cuisine || undefined,
+  vegetarian: item.vegetarian || undefined,
+  vegan: item.vegan || undefined,
+});
+
+// Convert Xotelo response into frontend place.
+const fromXotelo = (hotel: XoteloHotel): Place => ({
+  id: `xotelo:${hotel.hotel_key}`,
+  title: hotel.name,
+  kind: 'hotel',
+  latitude: Number(hotel.latitude),
+  longitude: Number(hotel.longitude),
+  distanceM: hotel.distance_m,
+  subtitle: 'Xotelo hotel listing',
+  hotelKey: hotel.hotel_key,
+  image: hotel.image || undefined,
+  rating:
+    typeof hotel.rating === 'number'
+      ? hotel.rating
+      : undefined,
+  matchStatus: hotel.match?.status || 'unmatched',
+});
+
+// Display hotel match confidence.
+function MatchInfo({
+  status,
+}: {
+  status?: MatchStatus;
+}) {
+  if (!status) {
+    return null;
+  }
+
+  const config = {
+    confirmed: {
+      label: 'Confirmed match (automated)',
+      color: GREEN,
+      background: '#DCFCE7',
+    },
+    possible: {
+      label: 'Attention required · match unverified',
+      color: AMBER,
+      background: '#FEF3C7',
+    },
+    unmatched: {
+      label: 'OSM match unavailable',
+      color: '#64748B',
+      background: '#F1F5F9',
+    },
+    'osm-only': {
+      label: 'Pricing information unavailable',
+      color: '#64748B',
+      background: '#F1F5F9',
+    },
+  }[status];
+
+  return (
+    <View
+      style={[
+        styles.statusPill,
+        { backgroundColor: config.background },
+      ]}
+    >
+      <Text
+        style={[
+          styles.statusText,
+          { color: config.color },
+        ]}
+      >
+        {config.label}
+      </Text>
+    </View>
+  );
+}
+
+export default function ExploreItineraryScreen() {
+  const mapRef = useRef<MapView>(null);
+  const scrollRef = useRef<ScrollView>(null);
+
+  const searchRequest = useRef(0);
+  const discoverRequest = useRef(0);
+  const priceRequest = useRef(0);
+
+  const cache = useRef(new Map<string, Place[]>());
+
+  // City search
+  const [query, setQuery] = useState('');
+  const [cityResults, setCityResults] = useState<City[]>([]);
+  const [city, setCity] = useState<City | null>(null);
+
+  const [citySearching, setCitySearching] = useState(false);
+  const [citySearchError, setCitySearchError] = useState('');
+  const [citySearched, setCitySearched] = useState(false);
+
+  // Backend connection
+  const [backendState, setBackendState] = useState<
+    'checking' | 'online' | 'offline'
+  >('checking');
+
+  const [backendMessage, setBackendMessage] = useState('');
+
+  // Discovery
+  const [tab, setTab] = useState<Category>('attraction');
+  const [places, setPlaces] = useState<Place[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const [anchor, setAnchor] = useState<Place | null>(null);
+
+  // Itinerary
+  const [day, setDay] = useState(1);
+  const [dayCount, setDayCount] = useState(3);
+
+  const [plans, setPlans] =
+    useState<Record<number, DayPlan>>({});
+
+  // Hotel selection
+  const [hotel, setHotel] = useState<Place | null>(null);
+
+  const [checkIn, setCheckIn] = useState('');
+  const [checkOut, setCheckOut] = useState('');
+
+  const [rate, setRate] = useState<Quote | null>(null);
+  const [rateLoading, setRateLoading] = useState(false);
+  const [rateError, setRateError] = useState('');
+
+  // Budget
+  const [budgetText, setBudgetText] = useState('');
+
+  const [manualAmounts, setManualAmounts] =
+    useState<Record<string, string>>({});
+
+  // Filters
+  const [diet, setDiet] = useState<
+    'all' | 'veg' | 'vegan'
+  >('all');
+
+  const [cuisine, setCuisine] = useState('');
+  const [maxNightPrice, setMaxNightPrice] = useState('');
+
+  const [showAllAttractions, setShowAllAttractions] =
+    useState(false);
+
+  // --------------------------------------------
+  // CHECK BACKEND CONNECTION
+  // --------------------------------------------
+  const checkBackend = async () => {
+    setBackendState('checking');
+    setBackendMessage('');
+
+    try {
+      const health = await getJson<{
+        status?: string;
+        database?: string;
+      }>('/health');
+
+      if (
+        health.status !== 'ok' ||
+        health.database !== 'connected'
+      ) {
+        throw new Error(
+          'Backend responded but PostgreSQL is not connected',
+        );
+      }
+
+      setBackendState('online');
+    } catch (e) {
+      setBackendState('offline');
+
+      setBackendMessage(
+        e instanceof Error
+          ? e.message
+          : 'Backend connection failed',
+      );
+    }
+  };
+
+  useEffect(() => {
+    void checkBackend();
+  }, []);
+
+  // --------------------------------------------
+  // CITY AUTOCOMPLETE
+  // --------------------------------------------
+  useEffect(() => {
+    const input = query.trim();
+
+    const id = ++searchRequest.current;
+
+    setCitySearchError('');
+    setCitySearched(false);
+
+    if (
+      input.length < 2 ||
+      (city && input === city.name)
+    ) {
+      setCityResults([]);
+      setCitySearching(false);
+      return;
+    }
+
+    setCitySearching(true);
+
+    const handle = setTimeout(async () => {
+      try {
+        const result = await getJson<{
+          cities: City[];
+        }>(
+          `/api/cities?search=${encodeURIComponent(input)}`,
+        );
+
+        if (id === searchRequest.current) {
+          setCityResults(
+            Array.isArray(result.cities)
+              ? result.cities
+              : [],
+          );
+
+          setCitySearched(true);
+          setBackendState('online');
+        }
+      } catch (e) {
+        if (id === searchRequest.current) {
+          setCityResults([]);
+
+          setCitySearchError(
+            e instanceof Error
+              ? e.message
+              : 'City search failed',
+          );
+
+          setBackendState('offline');
+        }
+      } finally {
+        if (id === searchRequest.current) {
+          setCitySearching(false);
+        }
+      }
+    }, 350);
+
+    return () => clearTimeout(handle);
+  }, [query, city]);
+
+  // --------------------------------------------
+  // FIND OR SELECT CITY
+  // --------------------------------------------
+  const searchOrSelectCity = async () => {
+    const input = query.trim();
+
+    if (input.length < 2) {
+      setCitySearchError(
+        'Type at least 2 letters to find a city.',
+      );
+      return;
+    }
+
+    if (cityResults.length === 1) {
+      chooseCity(cityResults[0]);
+      return;
+    }
+
+    Keyboard.dismiss();
+
+    setCitySearching(true);
+    setCitySearchError('');
+
+    const id = ++searchRequest.current;
+
+    try {
+      const result = await getJson<{
+        cities: City[];
+      }>(
+        `/api/cities?search=${encodeURIComponent(input)}`,
+      );
+
+      if (id !== searchRequest.current) {
+        return;
+      }
+
+      const found = Array.isArray(result.cities)
+        ? result.cities
+        : [];
+
+      setBackendState('online');
+      setCityResults(found);
+      setCitySearched(true);
+
+      const exact = found.find(
+        c => c.name.toLowerCase() === input.toLowerCase(),
+      );
+
+      if (exact) {
+        chooseCity(exact);
+      } else if (found.length === 1) {
+        chooseCity(found[0]);
+      }
+    } catch (e) {
+      if (id === searchRequest.current) {
+        setBackendState('offline');
+
+        setCitySearchError(
+          e instanceof Error
+            ? e.message
+            : 'City search failed',
+        );
+      }
+    } finally {
+      if (id === searchRequest.current) {
+        setCitySearching(false);
+      }
+    }
+  };
+
+  // --------------------------------------------
+  // FETCH ATTRACTIONS, FOOD, HOTELS
+  // --------------------------------------------
+  const fetchPlaces = async (
+    kind: Category,
+    selectedCity: City,
+    focus: Place | null,
+  ) => {
+    const request = ++discoverRequest.current;
+
+    setTab(kind);
+
+    if (kind === 'attraction') {
+      setShowAllAttractions(false);
+    }
+
+    setAnchor(focus);
+    setError('');
+    setLoading(true);
+    setPlaces([]);
+
+    const latitude =
+      focus?.latitude ?? selectedCity.latitude;
+
+    const longitude =
+      focus?.longitude ?? selectedCity.longitude;
+
+    const radius = focus ? 2000 : 6000;
+
+    const key = [
+      selectedCity.name,
+      kind,
+      latitude.toFixed(4),
+      longitude.toFixed(4),
+    ].join(':');
+
+    try {
+      let results = cache.current.get(key);
+
+      if (!results) {
+        if (kind === 'hotel') {
+          const params = new URLSearchParams({
+            city: selectedCity.name,
+            lat: String(latitude),
+            lon: String(longitude),
+            radius: String(radius),
+            limit: '12',
+            pages: '2',
+          });
+
+          const data = await getJson<{
+            hotels?: XoteloHotel[];
+            osm_only?: OsmPlace[];
+          }>(
+            `/api/hotels/matched?${params.toString()}`,
+          );
+
+          results = [
+            ...(data.hotels || []).map(fromXotelo),
+            ...(data.osm_only || []).map(p =>
+              fromOSM(p, 'hotel'),
+            ),
+          ];
+        } else {
+          const params = new URLSearchParams({
+            lat: String(latitude),
+            lon: String(longitude),
+            radius: String(radius),
+            limit: kind === 'attraction' ? '20' : '40',
+          });
+
+          const path =
+            kind === 'attraction'
+              ? `/api/attractions?${params.toString()}`
+              : `/api/nearby?type=restaurant&${params.toString()}`;
+
+          const data = await getJson<{
+            places?: OsmPlace[];
+          }>(path);
+
+          results = (data.places || []).map(p =>
+            fromOSM(p, kind),
+          );
+        }
+
+        cache.current.set(key, results);
+      }
+
+      if (request !== discoverRequest.current) {
+        return;
+      }
+
+      setPlaces(results);
+
+      mapRef.current?.animateToRegion(
+        {
+          latitude,
+          longitude,
+          latitudeDelta: focus ? 0.022 : 0.07,
+          longitudeDelta: focus ? 0.022 : 0.07,
+        },
+        450,
+      );
+    } catch (err) {
+      if (request !== discoverRequest.current) {
+        return;
+      }
+
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'Unable to retrieve places',
+      );
+    } finally {
+      if (request === discoverRequest.current) {
+        setLoading(false);
+      }
+    }
+  };
+
+  // --------------------------------------------
+  // CITY SELECTION
+  // --------------------------------------------
+  const chooseCity = (selected: City) => {
+    const change = () => {
+      searchRequest.current++;
+      discoverRequest.current++;
+
+      setCity(selected);
+      setQuery(selected.name);
+      setCityResults([]);
+      setCitySearchError('');
+      setCitySearched(false);
+
+      Keyboard.dismiss();
+
+      scrollRef.current?.scrollTo({
+        y: 0,
+        animated: true,
+      });
+
+      setPlans({});
+
+      priceRequest.current++;
+
+      setHotel(null);
+      setRate(null);
+      setManualAmounts({});
+      setDay(1);
+      setDiet('all');
+      setCuisine('');
+      setMaxNightPrice('');
+
+      void fetchPlaces('attraction', selected, null);
+    };
+
+    const hasPlan =
+      Object.values(plans).some(
+        p =>
+          p.attractions.length ||
+          p.restaurants.length,
+      ) || Boolean(hotel);
+
+    if (hasPlan && city?.name !== selected.name) {
+      Alert.alert(
+        'Change destination?',
+        'Your current unsaved itinerary will be cleared.',
+        [
+          {
+            text: 'Cancel',
+            style: 'cancel',
+          },
+          {
+            text: 'Change city',
+            style: 'destructive',
+            onPress: change,
+          },
+        ],
+      );
+    } else {
+      change();
+    }
+  };
+
+  // --------------------------------------------
+  // ITINERARY ACTIONS
+  // --------------------------------------------
+  const activePlan = plans[day] ?? makeEmptyDay();
+
+  const selectedOnDay = (item: Place) =>
+    (
+      item.kind === 'attraction'
+        ? activePlan.attractions
+        : activePlan.restaurants
+    ).some(p => p.id === item.id);
+
+  const toggleItem = (item: Place) => {
+    if (item.kind === 'hotel') {
+      priceRequest.current++;
+
+      setHotel(current =>
+        current?.id === item.id ? null : item,
+      );
+
+      setRate(null);
+      setRateLoading(false);
+      setRateError('');
+
+      return;
+    }
+
+    const field =
+      item.kind === 'attraction'
+        ? 'attractions'
+        : 'restaurants';
+
+    setPlans(previous => {
+      const current =
+        previous[day] ?? makeEmptyDay();
+
+      const previousList = current[field];
+
+      const nextList = previousList.some(
+        p => p.id === item.id,
+      )
+        ? previousList.filter(
+            p => p.id !== item.id,
+          )
+        : [...previousList, item];
+
+      return {
+        ...previous,
+        [day]: {
+          ...current,
+          [field]: nextList,
+        },
+      };
+    });
+  };
+
+  const browse = (
+    kind: Category,
+    from?: Place,
+  ) => {
+    if (city) {
+      void fetchPlaces(
+        kind,
+        city,
+        from ?? null,
+      );
+    }
+  };
+
+  // --------------------------------------------
+  // XOTELO HOTEL PRICE CHECK
+  // --------------------------------------------
+  const checkPrice = async () => {
+    if (!hotel?.hotelKey) {
+      Alert.alert(
+        'Price unavailable',
+        'This OSM hotel has no Xotelo hotel key.',
+      );
+
+      return;
+    }
+
+    const nights = nightsBetween(
+      checkIn,
+      checkOut,
+    );
+
+    const today = new Date()
+      .toISOString()
+      .slice(0, 10);
+
+    if (
+      !validDate(checkIn) ||
+      !validDate(checkOut) ||
+      checkIn < today ||
+      nights < 1 ||
+      nights > 30
+    ) {
+      Alert.alert(
+        'Invalid dates',
+        'Enter future YYYY-MM-DD dates for a stay of 1–30 nights.',
+      );
+
+      return;
+    }
+
+    const requestId = ++priceRequest.current;
+
+    setRateLoading(true);
+    setRateError('');
+    setRate(null);
+
+    try {
+      const params = new URLSearchParams({
+        hotel_key: hotel.hotelKey,
+        chk_in: checkIn,
+        chk_out: checkOut,
+        currency: 'GBP',
+        rooms: '1',
+        adults: '2',
+      });
+
+      const data = await getJson<{
+        data?: {
+          result?: {
+            rates?: {
+              name?: string;
+              rate?: number;
+            }[];
+          };
+        };
+      }>(
+        `/api/hotels/xotelo/rates?${params.toString()}`,
+      );
+
+      const offers = (
+        data.data?.result?.rates || []
+      )
+        .filter(
+          x =>
+            typeof x.rate === 'number' &&
+            Number.isFinite(x.rate) &&
+            x.rate > 0,
+        )
+        .sort(
+          (a, b) =>
+            (a.rate ?? Infinity) -
+            (b.rate ?? Infinity),
+        );
+
+      if (requestId !== priceRequest.current) {
+        return;
+      }
+
+      if (!offers.length) {
+        setRateError(
+          'No hotel price quotes available for those dates.',
+        );
+      } else {
+        setRate({
+          lowest: offers[0].rate!,
+          provider:
+            offers[0].name ||
+            'Xotelo provider',
+          checkIn,
+          checkOut,
+          nights,
+        });
+      }
+    } catch (err) {
+      if (requestId === priceRequest.current) {
+        setRateError(
+          err instanceof Error
+            ? err.message
+            : 'Could not retrieve hotel rates',
+        );
+      }
+    } finally {
+      if (requestId === priceRequest.current) {
+        setRateLoading(false);
+      }
+    }
+  };
+
+  // --------------------------------------------
+  // BUDGET CALCULATIONS
+  // --------------------------------------------
+  const selectedDays = Array.from(
+    { length: dayCount },
+    (_, index) =>
+      plans[index + 1] ?? makeEmptyDay(),
+  );
+
+  const manualItems = selectedDays.flatMap(
+    (p, index) =>
+      [
+        ...p.attractions,
+        ...p.restaurants,
+      ].map(item => ({
+        day: index + 1,
+        item,
+      })),
+  );
+
+  const manualSum = manualItems.reduce(
+    (sum, { day: planDay, item }) => {
+      const raw =
+        manualAmounts[
+          `${planDay}:${item.id}`
+        ];
+
+      const amount = Number(raw);
+
+      return (
+        sum +
+        (raw?.trim() &&
+        Number.isFinite(amount) &&
+        amount >= 0
+          ? amount
+          : 0)
+      );
+    },
+    0,
+  );
+
+  const missingEstimates =
+    manualItems.filter(
+      ({ day: planDay, item }) =>
+        !/^\d+(\.\d{1,2})?$/.test(
+          manualAmounts[
+            `${planDay}:${item.id}`
+          ] || '',
+        ),
+    ).length;
+
+  const quotedHotelTotal =
+    hotel && rate
+      ? rate.lowest * rate.nights
+      : null;
+
+  const knownSubtotal =
+    manualSum + (quotedHotelTotal ?? 0);
+
+  const budget = Number(budgetText);
+
+  const hasBudget =
+    budgetText.trim() !== '' &&
+    Number.isFinite(budget) &&
+    budget >= 0;
+
+  const hotelUnpriced = Boolean(
+    hotel && !rate,
+  );
+
+  const estimateIncomplete =
+    missingEstimates > 0 ||
+    hotelUnpriced;
+
+  // --------------------------------------------
+  // FILTERS
+  // --------------------------------------------
+  const filteredPlaces = useMemo(
+    () =>
+      places.filter(item => {
+        if (item.kind === 'restaurant') {
+          if (
+            diet === 'veg' &&
+            ![
+              'yes',
+              'only',
+              'limited',
+            ].includes(
+              item.vegetarian || '',
+            ) &&
+            ![
+              'yes',
+              'only',
+            ].includes(
+              item.vegan || '',
+            )
+          ) {
+            return false;
+          }
+
+          if (
+            diet === 'vegan' &&
+            ![
+              'yes',
+              'only',
+            ].includes(
+              item.vegan || '',
+            )
+          ) {
+            return false;
+          }
+
+          if (
+            cuisine.trim() &&
+            !(
+              item.cuisine || ''
+            )
+              .toLowerCase()
+              .includes(
+                cuisine
+                  .trim()
+                  .toLowerCase(),
+              )
+          ) {
+            return false;
+          }
+        }
+
+        if (
+          item.kind === 'hotel' &&
+          maxNightPrice.trim()
+        ) {
+          const max = Number(
+            maxNightPrice,
+          );
+
+          if (
+            !Number.isFinite(max) ||
+            max < 0 ||
+            !hotel ||
+            item.id !== hotel.id ||
+            !rate ||
+            rate.lowest > max
+          ) {
+            return false;
+          }
+        }
+
+        return true;
+      }),
+    [
+      places,
+      diet,
+      cuisine,
+      maxNightPrice,
+      hotel,
+      rate,
+    ],
+  );
+
+  const visiblePlaces =
+    tab === 'attraction' &&
+    !showAllAttractions
+      ? filteredPlaces.slice(0, 5)
+      : filteredPlaces;
+
+  // Map displays current results and selected itinerary.
+  const mapPoints = useMemo(() => {
+    const byId = new Map<
+      string,
+      Place
+    >();
+
+    visiblePlaces
+      .slice(0, 25)
+      .forEach(p =>
+        byId.set(p.id, p),
+      );
+
+    selectedDays.forEach(p =>
+      [
+        ...p.attractions,
+        ...p.restaurants,
+      ].forEach(item =>
+        byId.set(
+          item.id,
+          item,
+        ),
+      ),
+    );
+
+    if (hotel) {
+      byId.set(
+        hotel.id,
+        hotel,
+      );
+    }
+
+    return [
+      ...byId.values(),
+    ];
+  }, [
+    visiblePlaces,
+    selectedDays,
+    hotel,
+  ]);
+
+  // --------------------------------------------
+  // GOOGLE MAPS DIRECTIONS
+  // --------------------------------------------
+  const directions = async (
+    place: Place,
+  ) => {
+    const url =
+      'https://www.google.com/maps/dir/?api=1' +
+      `&destination=${place.latitude},${place.longitude}` +
+      '&travelmode=walking';
+
+    try {
+      await Linking.openURL(url);
+    } catch {
+      Alert.alert(
+        'Could not open directions',
+        'Google Maps could not be opened.',
+      );
+    }
+  };
+
+  const region: Region = {
+    latitude:
+      city?.latitude ?? 54.5,
+    longitude:
+      city?.longitude ?? -3.1,
+    latitudeDelta:
+      city ? 0.07 : 7,
+    longitudeDelta:
+      city ? 0.07 : 7,
+  };
+
+  // ============================================
+  // SCREEN UI
+  // ============================================
+  return (
+    <SafeAreaView style={styles.screen}>
+      <StatusBar
+        barStyle="dark-content"
+        backgroundColor={BG}
+        translucent={false}
+      />
+
+      <ScrollView
+        ref={scrollRef}
+        keyboardShouldPersistTaps="always"
+        contentContainerStyle={
+          styles.container
+        }
+      >
+        <Text style={styles.brand}>
+          MileMosaic
+        </Text>
+
+        <Text style={styles.heading}>
+          Explore your itinerary
+        </Text>
+
+        <Text style={styles.helper}>
+          Real UK places from your local
+          OSM database and hotel data
+          from Xotelo.
+        </Text>
+
+        {/* BACKEND STATUS */}
+        <View
+          style={styles.connectionBox}
+        >
+          <View
+            style={styles.rowBetween}
+          >
+            <Text
+              style={
+                styles.connectionLabel
+              }
+            >
+              {backendState === 'online'
+                ? '● Backend connected'
+                : backendState === 'checking'
+                ? '◌ Connecting to backend...'
+                : '● Backend not connected'}
+            </Text>
+
+            <Pressable
+              onPress={() =>
+                void checkBackend()
+              }
+            >
+              <Text style={styles.link}>
+                Retry
+              </Text>
+            </Pressable>
+          </View>
+
+          {backendState ===
+            'offline' && (
+            <Text
+              style={styles.errorText}
+            >
+              {backendMessage ||
+                citySearchError}
+              {'\n'}
+              Start Express on port
+              3001; for Android USB:
+              adb reverse tcp:3001
+              tcp:3001
+            </Text>
+          )}
+        </View>
+
+        {/* CITY SEARCH */}
+        <View style={styles.section}>
+          <Text style={styles.label}>
+            Destination — select a
+            result below
+          </Text>
+
+          <TextInput
+            style={styles.input}
+            value={query}
+            onChangeText={text => {
+              setQuery(text);
+              setCityResults([]);
+              setCitySearchError('');
+            }}
+            onSubmitEditing={() =>
+              void searchOrSelectCity()
+            }
+            returnKeyType="search"
+            placeholder="e.g. Leicester or London"
+            placeholderTextColor="#94A3B8"
+            autoCapitalize="words"
+            autoCorrect={false}
+            spellCheck={false}
+          />
+
+          <Pressable
+            style={
+              styles.searchButton
+            }
+            onPress={() =>
+              void searchOrSelectCity()
+            }
+          >
+            <Text
+              style={
+                styles.primaryButtonText
+              }
+            >
+              Find / Select city
+            </Text>
+          </Pressable>
+
+          {citySearching && (
+            <View
+              style={
+                styles.inlineStatus
+              }
+            >
+              <ActivityIndicator
+                size="small"
+                color={BLUE}
+              />
+
+              <Text
+                style={styles.muted}
+              >
+                Searching local UK
+                city database...
+              </Text>
+            </View>
+          )}
+
+          {Boolean(
+            citySearchError,
+          ) && (
+            <View
+              style={
+                styles.errorBox
+              }
+            >
+              <Text
+                style={
+                  styles.errorText
+                }
+              >
+                {citySearchError}
+              </Text>
+
+              <Text
+                style={styles.caption}
+              >
+                Check backend
+                and adb reverse.
+              </Text>
+            </View>
+          )}
+
+          {cityResults.length >
+            0 && (
+            <View
+              style={styles.dropdown}
+            >
+              <Text
+                style={
+                  styles.resultsTitle
+                }
+              >
+                Tap a destination
+                to load places
+              </Text>
+
+              {cityResults
+                .slice(0, 8)
+                .map(
+                  (
+                    item,
+                    index,
+                  ) => (
+                    <Pressable
+                      key={`${item.name}:${item.latitude}:${index}`}
+                      style={
+                        styles.suggestion
+                      }
+                      onPress={() =>
+                        chooseCity(item)
+                      }
+                    >
+                      <Text
+                        style={
+                          styles.itemTitle
+                        }
+                      >
+                        📍 {item.name}
+                      </Text>
+
+                      <Text
+                        style={
+                          styles.muted
+                        }
+                      >
+                        {
+                          item.place_type
+                        }
+                      </Text>
+                    </Pressable>
+                  ),
+                )}
+            </View>
+          )}
+
+          {citySearched &&
+            cityResults.length ===
+              0 &&
+            !citySearching &&
+            !citySearchError &&
+            !city && (
+              <Text
+                style={
+                  styles.caption
+                }
+              >
+                No matching city
+                found. Try a
+                shorter search.
+              </Text>
+            )}
+
+          {city && (
+            <Text
+              style={
+                styles.selectedCityText
+              }
+            >
+              ✓ Selected: {
+                city.name
+              }
+            </Text>
+          )}
+        </View>
+
+        {!city ? (
+          <View
+            style={styles.empty}
+          >
+            <Text
+              style={
+                styles.emptyIcon
+              }
+            >
+              📍
+            </Text>
+
+            <Text
+              style={
+                styles.emptyTitle
+              }
+            >
+              Where are you going?
+            </Text>
+
+            <Text
+              style={
+                styles.muted
+              }
+            >
+              Select a UK city to
+              load attractions,
+              food and hotels.
+            </Text>
+          </View>
+        ) : (
+          <>
+            {/* GOOGLE MAP */}
+            <View
+              style={
+                styles.rowBetween
+              }
+            >
+              <Text
+                style={
+                  styles.sectionTitle
+                }
+              >
+                {city.name} map
+              </Text>
+
+              <Text
+                style={
+                  styles.muted
+                }
+              >
+                {
+                  mapPoints.length
+                } plotted places
+              </Text>
+            </View>
+
+            <MapView
+              key={`${city.name}:${city.latitude}`}
+              ref={mapRef}
+              style={styles.map}
+              provider={
+                PROVIDER_GOOGLE
+              }
+              initialRegion={
+                region
+              }
+            >
+              {mapPoints
+                .filter(
+                  p =>
+                    Number.isFinite(
+                      p.latitude,
+                    ) &&
+                    Number.isFinite(
+                      p.longitude,
+                    ),
+                )
+                .map(item => (
+                  <Marker
+                    key={item.id}
+                    coordinate={{
+                      latitude:
+                        item.latitude,
+                      longitude:
+                        item.longitude,
+                    }}
+                    title={
+                      item.title
+                    }
+                    description={
+                      item.kind
+                    }
+                    pinColor={
+                      item.kind ===
+                      'hotel'
+                        ? '#7C3AED'
+                        : item.kind ===
+                          'restaurant'
+                        ? '#0D9488'
+                        : BLUE
+                    }
+                  />
+                ))}
+            </MapView>
+
+            {/* TRIP DAYS */}
+            <View
+              style={styles.section}
+            >
+              <View
+                style={
+                  styles.rowBetween
+                }
+              >
+                <Text
+                  style={
+                    styles.sectionTitle
+                  }
+                >
+                  Trip days
+                </Text>
+
+                <View
+                  style={styles.row}
+                >
+                  <Pressable
+                    style={
+                      styles.circleButton
+                    }
+                    onPress={() => {
+                      if (
+                        dayCount ===
+                        1
+                      ) {
+                        return;
+                      }
+
+                      const last =
+                        plans[
+                          dayCount
+                        ];
+
+                      if (
+                        last &&
+                        (last.attractions
+                          .length ||
+                          last.restaurants
+                            .length)
+                      ) {
+                        Alert.alert(
+                          'Day has places',
+                          'Remove the places from the last day first.',
+                        );
+
+                        return;
+                      }
+
+                      setDay(
+                        Math.min(
+                          day,
+                          dayCount -
+                            1,
+                        ),
+                      );
+
+                      setDayCount(
+                        dayCount -
+                          1,
+                      );
+                    }}
+                  >
+                    <Text
+                      style={
+                        styles.circleText
+                      }
+                    >
+                      −
+                    </Text>
+                  </Pressable>
+
+                  <Text
+                    style={
+                      styles.countText
+                    }
+                  >
+                    {dayCount}
+                  </Text>
+
+                  <Pressable
+                    style={
+                      styles.circleButton
+                    }
+                    onPress={() =>
+                      setDayCount(
+                        n =>
+                          Math.min(
+                            DAYS_LIMIT,
+                            n + 1,
+                          ),
+                      )
+                    }
+                  >
+                    <Text
+                      style={
+                        styles.circleText
+                      }
+                    >
+                      +
+                    </Text>
+                  </Pressable>
+                </View>
+              </View>
+
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={
+                  false
+                }
+                contentContainerStyle={
+                  styles.chipsRow
+                }
+              >
+                {Array.from(
+                  {
+                    length:
+                      dayCount,
+                  },
+                  (
+                    _,
+                    index,
+                  ) =>
+                    index +
+                    1,
+                ).map(n => (
+                  <Pressable
+                    key={n}
+                    onPress={() =>
+                      setDay(n)
+                    }
+                    style={[
+                      styles.chip,
+                      n === day &&
+                        styles.chipActive,
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.chipText,
+                        n ===
+                          day &&
+                          styles.chipTextActive,
+                      ]}
+                    >
+                      Day {n}
+                    </Text>
+                  </Pressable>
+                ))}
+              </ScrollView>
+            </View>
+
+            {/* DISCOVER */}
+            <View
+              style={styles.section}
+            >
+              <Text
+                style={
+                  styles.sectionTitle
+                }
+              >
+                Discover places
+              </Text>
+
+              <View
+                style={
+                  styles.chipsRow
+                }
+              >
+                {(
+                  [
+                    [
+                      'attraction',
+                      'Attractions',
+                    ],
+                    [
+                      'restaurant',
+                      'Food',
+                    ],
+                    [
+                      'hotel',
+                      'Hotels',
+                    ],
+                  ] as [
+                    Category,
+                    string,
+                  ][]
+                ).map(
+                  ([
+                    kind,
+                    text,
+                  ]) => (
+                    <Pressable
+                      key={kind}
+                      style={[
+                        styles.chip,
+                        kind ===
+                          tab &&
+                          styles.chipActive,
+                      ]}
+                      onPress={() =>
+                        browse(
+                          kind,
+                        )
+                      }
+                    >
+                      <Text
+                        style={[
+                          styles.chipText,
+                          tab ===
+                            kind &&
+                            styles.chipTextActive,
+                        ]}
+                      >
+                        {text}
+                      </Text>
+                    </Pressable>
+                  ),
+                )}
+              </View>
+
+              {anchor && (
+                <View
+                  style={
+                    styles.anchorBar
+                  }
+                >
+                  <Text
+                    style={
+                      styles.anchorText
+                    }
+                    numberOfLines={
+                      1
+                    }
+                  >
+                    Near: {
+                      anchor.title
+                    }
+                  </Text>
+
+                  <Pressable
+                    onPress={() =>
+                      browse(tab)
+                    }
+                  >
+                    <Text
+                      style={
+                        styles.link
+                      }
+                    >
+                      Clear
+                    </Text>
+                  </Pressable>
+                </View>
+              )}
+
+              {/* FOOD FILTERS */}
+              {tab ===
+                'restaurant' && (
+                <View
+                  style={
+                    styles.filterBox
+                  }
+                >
+                  <View
+                    style={
+                      styles.chipsRow
+                    }
+                  >
+                    {(
+                      [
+                        [
+                          'all',
+                          'All',
+                        ],
+                        [
+                          'veg',
+                          'Vegetarian tagged',
+                        ],
+                        [
+                          'vegan',
+                          'Vegan tagged',
+                        ],
+                      ] as [
+                        typeof diet,
+                        string,
+                      ][]
+                    ).map(
+                      ([
+                        value,
+                        text,
+                      ]) => (
+                        <Pressable
+                          key={
+                            value
+                          }
+                          style={[
+                            styles.smallChip,
+                            value ===
+                              diet &&
+                              styles.smallChipOn,
+                          ]}
+                          onPress={() =>
+                            setDiet(
+                              value,
+                            )
+                          }
+                        >
+                          <Text
+                            style={
+                              styles.smallChipText
+                            }
+                          >
+                            {text}
+                          </Text>
+                        </Pressable>
+                      ),
+                    )}
+                  </View>
+
+                  <TextInput
+                    style={
+                      styles.input
+                    }
+                    placeholder="Filter cuisine (e.g. indian)"
+                    placeholderTextColor="#94A3B8"
+                    value={
+                      cuisine
+                    }
+                    onChangeText={
+                      setCuisine
+                    }
+                  />
+
+                  <Text
+                    style={
+                      styles.caption
+                    }
+                  >
+                    Food preferences
+                    use available
+                    OSM tags only.
+                  </Text>
+                </View>
+              )}
+
+              {/* HOTEL FILTER */}
+              {tab ===
+                'hotel' && (
+                <View
+                  style={
+                    styles.filterBox
+                  }
+                >
+                  <TextInput
+                    style={
+                      styles.input
+                    }
+                    placeholder="Max GBP / night (checked rates)"
+                    placeholderTextColor="#94A3B8"
+                    keyboardType="decimal-pad"
+                    value={
+                      maxNightPrice
+                    }
+                    onChangeText={
+                      setMaxNightPrice
+                    }
+                  />
+
+                  <Text
+                    style={
+                      styles.caption
+                    }
+                  >
+                    Select a hotel
+                    and check its
+                    rate first.
+                    Unpriced hotels
+                    are hidden by
+                    this filter.
+                  </Text>
+                </View>
+              )}
+
+              {/* LOADING */}
+              {loading && (
+                <ActivityIndicator
+                  color={BLUE}
+                  size="large"
+                  style={
+                    styles.loader
+                  }
+                />
+              )}
+
+              {/* ERRORS */}
+              {Boolean(
+                error,
+              ) && (
+                <View
+                  style={
+                    styles.errorBox
+                  }
+                >
+                  <Text
+                    style={
+                      styles.errorText
+                    }
+                  >
+                    {error}
+                  </Text>
+
+                  <Pressable
+                    onPress={() =>
+                      city &&
+                      void fetchPlaces(
+                        tab,
+                        city,
+                        anchor,
+                      )
+                    }
+                  >
+                    <Text
+                      style={
+                        styles.link
+                      }
+                    >
+                      Retry
+                    </Text>
+                  </Pressable>
+                </View>
+              )}
+
+              {!loading &&
+                !error &&
+                filteredPlaces.length ===
+                  0 && (
+                  <Text
+                    style={
+                      styles.muted
+                    }
+                  >
+                    No places found
+                    for these
+                    filters.
+                  </Text>
+                )}
+
+              {tab ===
+                'attraction' &&
+                !loading &&
+                !error && (
+                  <Text
+                    style={
+                      styles.caption
+                    }
+                  >
+                    Showing nearest
+                    OSM attractions,
+                    not a
+                    popularity
+                    ranking.
+                  </Text>
+                )}
+
+              {/* PLACE CARDS */}
+              {!loading &&
+                visiblePlaces.map(
+                  item => {
+                    const isSelected =
+                      item.kind ===
+                      'hotel'
+                        ? hotel?.id ===
+                          item.id
+                        : selectedOnDay(
+                            item,
+                          );
+
+                    return (
+                      <View
+                        key={
+                          item.id
+                        }
+                        style={
+                          styles.placeCard
+                        }
+                      >
+                        {item.image ? (
+                          <Image
+                            source={{
+                              uri: item.image,
+                            }}
+                            style={
+                              styles.hotelImage
+                            }
+                            resizeMode="cover"
+                          />
+                        ) : null}
+
+                        <View
+                          style={
+                            styles.rowBetween
+                          }
+                        >
+                          <View
+                            style={
+                              styles.flexOne
+                            }
+                          >
+                            <Text
+                              style={
+                                styles.itemTitle
+                              }
+                            >
+                              {
+                                item.title
+                              }
+                            </Text>
+
+                            <Text
+                              style={
+                                styles.muted
+                              }
+                            >
+                              {
+                                item.subtitle
+                              }
+                              {typeof item.distanceM ===
+                              'number'
+                                ? ` · ${Math.round(
+                                    item.distanceM,
+                                  )} m`
+                                : ''}
+                              {typeof item.rating ===
+                              'number'
+                                ? ` · ★ ${item.rating.toFixed(
+                                    1,
+                                  )}`
+                                : ''}
+                            </Text>
+                          </View>
+
+                          <Text
+                            style={
+                              styles.placeIcon
+                            }
+                          >
+                            {item.kind ===
+                            'hotel'
+                              ? '🏨'
+                              : item.kind ===
+                                'restaurant'
+                              ? '🍽️'
+                              : '📍'}
+                          </Text>
+                        </View>
+
+                        <MatchInfo
+                          status={
+                            item.matchStatus
+                          }
+                        />
+
+                        {item.kind ===
+                          'restaurant' && (
+                          <Text
+                            style={
+                              styles.caption
+                            }
+                          >
+                            {item.cuisine
+                              ? `Cuisine: ${item.cuisine.replace(
+                                  /;/g,
+                                  ', ',
+                                )}`
+                              : 'Cuisine not tagged'}
+                            {' · '}
+                            {item.vegetarian
+                              ? `Veg: ${item.vegetarian}`
+                              : 'Diet not verified'}
+                          </Text>
+                        )}
+
+                        {item.kind !==
+                          'hotel' && (
+                          <Text
+                            style={
+                              styles.caption
+                            }
+                          >
+                            Entry / menu
+                            price:
+                            unavailable
+                            from OSM
+                          </Text>
+                        )}
+
+                        <View
+                          style={
+                            styles.actionRow
+                          }
+                        >
+                          <Pressable
+                            style={[
+                              styles.primaryButton,
+                              isSelected &&
+                                styles.removeButton,
+                            ]}
+                            onPress={() =>
+                              toggleItem(
+                                item,
+                              )
+                            }
+                          >
+                            <Text
+                              style={
+                                styles.primaryButtonText
+                              }
+                            >
+                              {isSelected
+                                ? 'Remove'
+                                : item.kind ===
+                                  'hotel'
+                                ? 'Choose stay'
+                                : item.kind ===
+                                  'restaurant'
+                                ? `Add food · D${day}`
+                                : `Add · Day ${day}`}
+                            </Text>
+                          </Pressable>
+
+                          <Pressable
+                            style={
+                              styles.outlineButton
+                            }
+                            onPress={() =>
+                              void directions(
+                                item,
+                              )
+                            }
+                          >
+                            <Text
+                              style={
+                                styles.outlineText
+                              }
+                            >
+                              Directions
+                            </Text>
+                          </Pressable>
+                        </View>
+
+                        {item.kind ===
+                          'attraction' && (
+                          <View
+                            style={
+                              styles.actionRow
+                            }
+                          >
+                            <Pressable
+                              onPress={() =>
+                                browse(
+                                  'restaurant',
+                                  item,
+                                )
+                              }
+                            >
+                              <Text
+                                style={
+                                  styles.link
+                                }
+                              >
+                                Food nearby
+                              </Text>
+                            </Pressable>
+
+                            <Pressable
+                              onPress={() =>
+                                browse(
+                                  'hotel',
+                                  item,
+                                )
+                              }
+                            >
+                              <Text
+                                style={
+                                  styles.link
+                                }
+                              >
+                                Accommodation nearby
+                              </Text>
+                            </Pressable>
+                          </View>
+                        )}
+                      </View>
+                    );
+                  },
+                )}
+
+              {tab ===
+                'attraction' &&
+                !loading &&
+                filteredPlaces.length >
+                  5 && (
+                  <Pressable
+                    style={
+                      styles.outlineButton
+                    }
+                    onPress={() =>
+                      setShowAllAttractions(
+                        v => !v,
+                      )
+                    }
+                  >
+                    <Text
+                      style={
+                        styles.outlineText
+                      }
+                    >
+                      {showAllAttractions
+                        ? 'Show first 5 nearby places'
+                        : `Show ${
+                            filteredPlaces.length -
+                            5
+                          } more nearby attractions`}
+                    </Text>
+                  </Pressable>
+                )}
+            </View>
+
+            {/* DAY ITINERARY */}
+            <View
+              style={styles.section}
+            >
+              <Text
+                style={
+                  styles.sectionTitle
+                }
+              >
+                Your itinerary ·
+                Day {day}
+              </Text>
+
+              {!activePlan.attractions
+                .length &&
+                !activePlan.restaurants
+                  .length && (
+                  <Text
+                    style={
+                      styles.muted
+                    }
+                  >
+                    Nothing added
+                    yet. Add places
+                    from the cards
+                    above.
+                  </Text>
+                )}
+
+              {[
+                ...activePlan.attractions,
+                ...activePlan.restaurants,
+              ].map(item => (
+                <View
+                  style={
+                    styles.planItem
+                  }
+                  key={
+                    item.id
+                  }
+                >
+                  <View
+                    style={
+                      styles.flexOne
+                    }
+                  >
+                    <Text
+                      style={
+                        styles.itemTitle
+                      }
+                    >
+                      {
+                        item.title
+                      }
+                    </Text>
+
+                    <Text
+                      style={
+                        styles.caption
+                      }
+                    >
+                      {item.kind ===
+                      'attraction'
+                        ? 'Attraction'
+                        : 'Food'}
+                      {' · '}
+                      Manual cost
+                      estimate
+                    </Text>
+                  </View>
+
+                  <TextInput
+                    style={
+                      styles.costInput
+                    }
+                    placeholder="£ amount"
+                    placeholderTextColor="#94A3B8"
+                    keyboardType="decimal-pad"
+                    value={
+                      manualAmounts[
+                        `${day}:${item.id}`
+                      ] || ''
+                    }
+                    onChangeText={
+                      value =>
+                        setManualAmounts(
+                          prev => ({
+                            ...prev,
+                            [`${day}:${item.id}`]:
+                              value,
+                          }),
+                        )
+                    }
+                  />
+
+                  <Pressable
+                    onPress={() =>
+                      toggleItem(
+                        item,
+                      )
+                    }
+                  >
+                    <Text
+                      style={
+                        styles.removeText
+                      }
+                    >
+                      ×
+                    </Text>
+                  </Pressable>
+                </View>
+              ))}
+            </View>
+
+            {/* ACCOMMODATION */}
+            <View
+              style={styles.section}
+            >
+              <Text
+                style={
+                  styles.sectionTitle
+                }
+              >
+                Accommodation ·
+                entire trip
+              </Text>
+
+              {hotel ? (
+                <>
+                  <View
+                    style={
+                      styles.rowBetween
+                    }
+                  >
+                    <View
+                      style={
+                        styles.flexOne
+                      }
+                    >
+                      <Text
+                        style={
+                          styles.itemTitle
+                        }
+                      >
+                        {
+                          hotel.title
+                        }
+                      </Text>
+
+                      <MatchInfo
+                        status={
+                          hotel.matchStatus
+                        }
+                      />
+                    </View>
+
+                    <Pressable
+                      onPress={() => {
+                        priceRequest.current++;
+                        setHotel(
+                          null,
+                        );
+                        setRate(
+                          null,
+                        );
+                        setRateLoading(
+                          false,
+                        );
+                      }}
+                    >
+                      <Text
+                        style={
+                          styles.link
+                        }
+                      >
+                        Remove
+                      </Text>
+                    </Pressable>
+                  </View>
+
+                  <Text
+                    style={
+                      styles.caption
+                    }
+                  >
+                    Prices use
+                    this hotel's
+                    exact Xotelo
+                    key. Match
+                    status only
+                    describes the
+                    OSM association.
+                  </Text>
+
+                  <View
+                    style={
+                      styles.datesRow
+                    }
+                  >
+                    <View
+                      style={
+                        styles.flexOne
+                      }
+                    >
+                      <Text
+                        style={
+                          styles.label
+                        }
+                      >
+                        Check-in
+                      </Text>
+
+                      <TextInput
+                        style={
+                          styles.input
+                        }
+                        placeholder="YYYY-MM-DD"
+                        placeholderTextColor="#94A3B8"
+                        value={
+                          checkIn
+                        }
+                        onChangeText={
+                          value => {
+                            priceRequest.current++;
+                            setRateLoading(
+                              false,
+                            );
+                            setCheckIn(
+                              value,
+                            );
+                            setRate(
+                              null,
+                            );
+                          }
+                        }
+                      />
+                    </View>
+
+                    <View
+                      style={
+                        styles.flexOne
+                      }
+                    >
+                      <Text
+                        style={
+                          styles.label
+                        }
+                      >
+                        Check-out
+                      </Text>
+
+                      <TextInput
+                        style={
+                          styles.input
+                        }
+                        placeholder="YYYY-MM-DD"
+                        placeholderTextColor="#94A3B8"
+                        value={
+                          checkOut
+                        }
+                        onChangeText={
+                          value => {
+                            priceRequest.current++;
+                            setRateLoading(
+                              false,
+                            );
+                            setCheckOut(
+                              value,
+                            );
+                            setRate(
+                              null,
+                            );
+                          }
+                        }
+                      />
+                    </View>
+                  </View>
+
+                  <Pressable
+                    style={
+                      styles.primaryButton
+                    }
+                    disabled={
+                      rateLoading
+                    }
+                    onPress={() =>
+                      void checkPrice()
+                    }
+                  >
+                    <Text
+                      style={
+                        styles.primaryButtonText
+                      }
+                    >
+                      {rateLoading
+                        ? 'Checking…'
+                        : 'Check GBP hotel quotes'}
+                    </Text>
+                  </Pressable>
+
+                  {rateLoading && (
+                    <ActivityIndicator
+                      color={BLUE}
+                      style={
+                        styles.smallLoader
+                      }
+                    />
+                  )}
+
+                  {Boolean(
+                    rateError,
+                  ) && (
+                    <Text
+                      style={
+                        styles.errorText
+                      }
+                    >
+                      {
+                        rateError
+                      }
+                    </Text>
+                  )}
+
+                  {rate && (
+                    <View
+                      style={
+                        styles.quoteCard
+                      }
+                    >
+                      <Text
+                        style={
+                          styles.quotePrice
+                        }
+                      >
+                        {gbp(
+                          rate.lowest,
+                        )}
+                        {' '}
+                        / room / night
+                      </Text>
+
+                      <Text
+                        style={
+                          styles.caption
+                        }
+                      >
+                        Lowest quote:
+                        {' '}
+                        {
+                          rate.provider
+                        }
+                        .{' '}
+                        {
+                          rate.nights
+                        } nights ≈{' '}
+                        {gbp(
+                          rate.lowest *
+                            rate.nights,
+                        )}
+                        .
+                      </Text>
+
+                      <Text
+                        style={
+                          styles.caption
+                        }
+                      >
+                        Indicative
+                        quote only.
+                        Taxes and
+                        fees may
+                        be excluded.
+                        Not a
+                        reservation.
+                      </Text>
+                    </View>
+                  )}
+                </>
+              ) : (
+                <Text
+                  style={
+                    styles.muted
+                  }
+                >
+                  No hotel
+                  selected.
+                  Browse Hotels
+                  or use
+                  Accommodation
+                  nearby.
+                </Text>
+              )}
+            </View>
+
+            {/* BUDGET */}
+            <View
+              style={styles.section}
+            >
+              <Text
+                style={
+                  styles.sectionTitle
+                }
+              >
+                Trip budget · GBP
+              </Text>
+
+              <Text
+                style={
+                  styles.label
+                }
+              >
+                Your total budget
+                (optional)
+              </Text>
+
+              <TextInput
+                style={
+                  styles.input
+                }
+                value={
+                  budgetText
+                }
+                onChangeText={
+                  setBudgetText
+                }
+                keyboardType="decimal-pad"
+                placeholder="e.g. 500"
+                placeholderTextColor="#94A3B8"
+              />
+
+              <View
+                style={
+                  styles.budgetRow
+                }
+              >
+                <Text
+                  style={
+                    styles.muted
+                  }
+                >
+                  Known / manually
+                  estimated subtotal
+                </Text>
+
+                <Text
+                  style={
+                    styles.quotePrice
+                  }
+                >
+                  {gbp(
+                    knownSubtotal,
+                  )}
+                </Text>
+              </View>
+
+              {hasBudget && (
+                <Text
+                  style={
+                    styles.caption
+                  }
+                >
+                  {knownSubtotal >
+                  budget
+                    ? `Known subtotal is ${gbp(
+                        knownSubtotal -
+                          budget,
+                      )} above budget.`
+                    : `${gbp(
+                        budget -
+                          knownSubtotal,
+                      )} remaining against known costs.`}
+                </Text>
+              )}
+
+              <Text
+                style={
+                  styles.caption
+                }
+              >
+                {
+                  missingEstimates
+                } activities/meals
+                without price
+                estimates
+                {hotelUnpriced
+                  ? ' · hotel rate unavailable'
+                  : ''}
+                .
+                {estimateIncomplete
+                  ? ' Total trip cost is incomplete.'
+                  : ' Transport and other costs may still be missing.'}
+              </Text>
+
+              <Text
+                style={
+                  styles.caption
+                }
+              >
+                Your itinerary
+                is currently
+                stored only
+                in screen memory.
+                It is not yet
+                saved to
+                PostgreSQL.
+              </Text>
+            </View>
+          </>
+        )}
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+// ============================================
+// STYLES
+// ============================================
+const styles = StyleSheet.create({
+  screen: {
+    flex: 1,
+    backgroundColor: BG,
+  },
+
+  container: {
+    padding: 16,
+    paddingBottom: 60,
+    paddingTop:
+      Platform.OS === 'android'
+        ? 20
+        : 16,
+  },
+
+  brand: {
+    fontSize: 15,
+    fontWeight: '800',
+    color: BLUE,
+    letterSpacing: 1.2,
+    marginBottom: 5,
+  },
+
+  heading: {
+    fontSize: 27,
+    fontWeight: '800',
+    color: NAVY,
+  },
+
+  helper: {
+    fontSize: 13,
+    color: '#64748B',
+    marginTop: 5,
+    marginBottom: 18,
+    lineHeight: 19,
+  },
+
+  section: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 18,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: BORDER,
+    marginBottom: 14,
+  },
+
+  sectionTitle: {
+    color: NAVY,
+    fontWeight: '800',
+    fontSize: 17,
+    marginBottom: 10,
+  },
+
+  label: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#475569',
+    marginBottom: 6,
+  },
+
+  input: {
+    borderWidth: 1,
+    borderColor: '#CBD5E1',
+    borderRadius: 11,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    color: NAVY,
+    backgroundColor: '#FFFFFF',
+    fontSize: 14,
+    minHeight: 44,
+  },
+
+  smallLoader: {
+    marginVertical: 10,
+  },
+
+  connectionBox: {
+    backgroundColor: '#EFF6FF',
+    borderColor: '#BFDBFE',
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginBottom: 14,
+  },
+
+  connectionLabel: {
+    color: '#1D4ED8',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+
+  searchButton: {
+    backgroundColor: BLUE,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 11,
+    paddingVertical: 12,
+    marginTop: 10,
+  },
+
+  inlineStatus: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginTop: 10,
+  },
+
+  selectedCityText: {
+    color: GREEN,
+    fontSize: 12,
+    fontWeight: '800',
+    marginTop: 10,
+  },
+
+  resultsTitle: {
+    color: BLUE,
+    fontSize: 12,
+    fontWeight: '800',
+    marginVertical: 6,
+    paddingHorizontal: 10,
+  },
+
+  dropdown: {
+    borderWidth: 1,
+    borderColor: BORDER,
+    marginTop: 8,
+    borderRadius: 12,
+    overflow: 'hidden',
+  },
+
+  suggestion: {
+    padding: 12,
+    borderBottomWidth:
+      StyleSheet.hairlineWidth,
+    borderColor: BORDER,
+  },
+
+  itemTitle: {
+    color: NAVY,
+    fontSize: 14,
+    fontWeight: '700',
+    lineHeight: 20,
+  },
+
+  muted: {
+    fontSize: 12,
+    color: '#64748B',
+    lineHeight: 18,
+  },
+
+  caption: {
+    fontSize: 11,
+    color: '#64748B',
+    lineHeight: 16,
+    marginTop: 5,
+  },
+
+  row: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+
+  rowBetween: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent:
+      'space-between',
+    gap: 10,
+    marginBottom: 10,
+  },
+
+  flexOne: {
+    flex: 1,
+  },
+
+  map: {
+    height: 250,
+    borderRadius: 16,
+    marginBottom: 14,
+  },
+
+  chipsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingBottom: 4,
+    flexWrap: 'wrap',
+  },
+
+  chip: {
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: '#FFFFFF',
+    paddingVertical: 9,
+    paddingHorizontal: 13,
+    borderRadius: 24,
+  },
+
+  chipActive: {
+    backgroundColor: BLUE,
+    borderColor: BLUE,
+  },
+
+  chipText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#475569',
+  },
+
+  chipTextActive: {
+    color: '#FFFFFF',
+  },
+
+  circleButton: {
+    borderWidth: 1,
+    borderColor: BORDER,
+    borderRadius: 20,
+    height: 30,
+    width: 30,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+
+  circleText: {
+    fontSize: 20,
+    color: NAVY,
+    lineHeight: 24,
+  },
+
+  countText: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: NAVY,
+  },
+
+  anchorBar: {
+    borderRadius: 10,
+    backgroundColor: '#EFF6FF',
+    padding: 10,
+    flexDirection: 'row',
+    justifyContent:
+      'space-between',
+    gap: 12,
+    marginVertical: 10,
+  },
+
+  anchorText: {
+    flex: 1,
+    color: '#1D4ED8',
+    fontWeight: '700',
+    fontSize: 12,
+  },
+
+  filterBox: {
+    gap: 9,
+    marginVertical: 10,
+  },
+
+  smallChip: {
+    paddingHorizontal: 9,
+    paddingVertical: 7,
+    borderWidth: 1,
+    borderRadius: 14,
+    borderColor: BORDER,
+  },
+
+  smallChipOn: {
+    backgroundColor: '#DBEAFE',
+    borderColor: BLUE,
+  },
+
+  smallChipText: {
+    fontSize: 10,
+    color: NAVY,
+    fontWeight: '600',
+  },
+
+  loader: {
+    paddingVertical: 24,
+  },
+
+  errorBox: {
+    padding: 12,
+    backgroundColor: '#FEF2F2',
+    borderRadius: 10,
+    marginTop: 8,
+  },
+
+  errorText: {
+    color: '#B91C1C',
+    fontSize: 12,
+    marginVertical: 6,
+  },
+
+  placeCard: {
+    borderWidth: 1,
+    borderColor: BORDER,
+    borderRadius: 14,
+    padding: 12,
+    marginTop: 10,
+    gap: 7,
+  },
+
+  placeIcon: {
+    fontSize: 23,
+  },
+
+  hotelImage: {
+    height: 120,
+    width: '100%',
+    borderRadius: 10,
+  },
+
+  statusPill: {
+    paddingHorizontal: 9,
+    paddingVertical: 6,
+    alignSelf: 'flex-start',
+    borderRadius: 9,
+    marginTop: 5,
+  },
+
+  statusText: {
+    fontSize: 11,
+    fontWeight: '700',
+  },
+
+  actionRow: {
+    flexDirection: 'row',
+    gap: 12,
+    alignItems: 'center',
+    marginTop: 6,
+    flexWrap: 'wrap',
+  },
+
+  primaryButton: {
+    backgroundColor: BLUE,
+    paddingVertical: 10,
+    paddingHorizontal: 13,
+    borderRadius: 10,
+    alignSelf: 'flex-start',
+  },
+
+  removeButton: {
+    backgroundColor: '#64748B',
+  },
+
+  primaryButtonText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+
+  outlineButton: {
+    borderWidth: 1,
+    borderColor: BLUE,
+    borderRadius: 10,
+    paddingVertical: 9,
+    paddingHorizontal: 12,
+  },
+
+  outlineText: {
+    color: BLUE,
+    fontSize: 12,
+    fontWeight: '800',
+  },
+
+  link: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: BLUE,
+  },
+
+  empty: {
+    padding: 35,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 18,
+    alignItems: 'center',
+    gap: 8,
+  },
+
+  emptyIcon: {
+    fontSize: 36,
+  },
+
+  emptyTitle: {
+    fontSize: 17,
+    fontWeight: '800',
+    color: NAVY,
+  },
+
+  planItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: BORDER,
+  },
+
+  costInput: {
+    width: 90,
+    borderWidth: 1,
+    borderColor: BORDER,
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 8,
+    color: NAVY,
+    fontSize: 12,
+  },
+
+  removeText: {
+    fontSize: 25,
+    color: '#DC2626',
+    paddingHorizontal: 4,
+  },
+
+  datesRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginVertical: 12,
+  },
+
+  quoteCard: {
+    borderRadius: 12,
+    backgroundColor: '#F0FDF4',
+    padding: 12,
+    marginTop: 12,
+  },
+
+  quotePrice: {
+    fontWeight: '800',
+    fontSize: 17,
+    color: GREEN,
+  },
+
+  budgetRow: {
+    flexDirection: 'row',
+    justifyContent:
+      'space-between',
+    alignItems: 'center',
+    marginVertical: 14,
+    gap: 8,
+  },
+});
